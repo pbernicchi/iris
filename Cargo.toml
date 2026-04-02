@@ -1,0 +1,61 @@
+[package]
+name = "iris"
+version = "0.1.0"
+edition = "2021"
+default-run = "iris"
+
+[features]
+# Uncomment to enable cache debug tracking (tracks specific cache line across all operations)
+debug_cache = []
+developer = []
+developer_ip7 = []  # CP0 Compare/timer calibration stats and debug prints
+# Lightning: pedal-to-the-metal build — disables breakpoint checks and traceback buffer updates.
+# Incompatible with interactive debugging. For end-user / benchmarking builds only.
+lightning = []
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+log = "0.4"
+env_logger = "0.10"
+winit = "0.29"
+glutin = "0.31"
+glutin-winit = "0.4"
+glow = "0.13"
+raw-window-handle = "0.5"
+rtrb = "0.3"
+socket2 = "0.5"
+crossbeam-utils = "0.8"
+bitfield = "0.14"
+cpal = "0.15"
+smoltcp = { version = "0.12", default-features = false, features = ["std", "log", "medium-ethernet", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp", "socket-icmp", "socket-raw"] }
+serde = { version = "1.0.228", features = ["derive"] }
+toml = "1.0.3"
+parking_lot = "0.12"
+spin = "0.10.0"
+
+# Developer profile: release optimizations + debug symbols. Default build target.
+# Enables the "developer" feature flag for dev-only tooling.
+# Usage: cargo build  (or explicitly: cargo build --profile developer)
+[profile.developer]
+inherits = "release"
+debug = true
+
+# Profiling profile: release optimizations + full debug info for flamegraph/perf.
+# Usage: cargo build --profile profiling && perf record ./target/profiling/iris
+#        cargo flamegraph --profile profiling
+[profile.profiling]
+inherits = "release"
+debug = 2
+strip = false
+force-frame-pointers = true
+
+[[bin]]
+name = "iris"
+path = "src/main.rs"
+
+[[bin]]
+name = "coffdump"
+path = "src/coffdump.rs"
+
+
+

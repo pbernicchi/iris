@@ -1,0 +1,38 @@
+# iris.toml — IRIS emulator configuration
+# All paths are relative to the directory you run iris from.
+# Command-line flags override any value set here.
+
+# PROM ROM image (required).
+prom = "prom.bin"
+
+# RAM bank sizes in MB.
+# Each bank must be 0 (absent), 8, 16, 32, 64, or 128.
+# The SGI Indy supports up to two populated banks; banks 2 and 3 are
+# typically absent.  Total RAM = sum of non-zero banks.
+banks = [128, 128, 0, 0]
+
+# SCSI devices.
+# Valid IDs: 1–7.  The SCSI controller itself occupies ID 0.
+# Typical Indy layout:
+#   ID 1 — internal hard disk
+#   ID 4 — internal CD-ROM (removable, 512-byte block mode)
+#   ID 6 — optional second hard disk or tape
+
+# Internal hard disk
+[scsi.1]
+path   = "scsi1.raw"
+cdrom  = false
+
+# Internal hard disk
+[scsi.2]
+path   = "scsi2.raw"
+cdrom  = false
+
+# Internal CD-ROM.
+# For a single disc, set path only.
+# For a changer (cycled with "scsi eject 4" in the monitor), list all
+# ISO images in `discs`; the first entry is mounted at startup.
+[scsi.4]
+path   = "cdrom4.iso"
+cdrom  = true
+# discs = ["irix65.iso", "extras.iso", "patches.iso"]

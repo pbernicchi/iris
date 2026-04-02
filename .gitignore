@@ -1,0 +1,8 @@
+ignore/
+target/
+.mcp.json
+launch.json
+tasks.json
+scsi1.raw
+scsi2.raw
+cdrom4.iso
