@@ -90,7 +90,7 @@ struct MemoryWrite {
     virt_addr: u64,
     phys_addr: u64,
     old_value: u64,
-    size: MemAccessSize,
+    size: usize,
 }
 
 /// CPU state snapshot for undo - includes core state and metadata
@@ -439,34 +439,23 @@ pub fn exec_xtlb_miss(code: u32) -> ExecStatus {
     EXEC_IS_EXCEPTION | EXEC_IS_TLB_REFILL | EXEC_IS_XTLB_REFILL | (code << crate::mips_core::CAUSE_EXCCODE_SHIFT)
 }
 
-/// Memory access size for load/store operations
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum MemAccessSize {
-    Byte   = 1,
-    Half   = 2,
-    Word   = 4,
-    Double = 8,
+/// Alignment mask for a memory access of SIZE bytes.
+/// `addr & align_mask_for::<SIZE>() != 0` means misaligned.
+#[inline(always)]
+const fn align_mask_for<const SIZE: usize>() -> u64 {
+    (SIZE as u64) - 1
 }
 
-impl MemAccessSize {
-    /// Alignment mask: `addr & align_mask() != 0` means misaligned.
-    #[inline(always)]
-    pub fn align_mask(self) -> u64 {
-        (self as u64) - 1
-    }
+/// Full data mask for SIZE bytes (e.g. SIZE=4 → 0xFFFF_FFFF).
+#[inline(always)]
+const fn full_mask_for<const SIZE: usize>() -> u64 {
+    if SIZE == 8 { !0u64 } else { !0u64 >> (64 - SIZE * 8) }
+}
 
-    /// Full data mask for this access width (e.g. Word → 0xFFFF_FFFF).
-    #[inline(always)]
-    pub fn full_mask(self) -> u64 {
-        !0u64 >> (64 - (self as u32) * 8)
-    }
-
-    /// Number of bytes.
-    #[inline(always)]
-    pub fn bytes(self) -> usize {
-        self as usize
-    }
+/// Runtime version of full_mask_for for use in command parsers.
+#[inline(always)]
+fn full_mask_for_usize(size: usize) -> u64 {
+    if size == 8 { !0u64 } else { !0u64 >> (64 - size * 8) }
 }
 
 /// Cache coherency attributes — values match the MIPS C0 EntryLo C field.
@@ -1541,13 +1530,20 @@ For R4000SC/MC CPUs:
     }
 
     /// Production data read (with breakpoints, updates CP0 state on exceptions).
-    fn read_data(&mut self, virt_addr: u64, size: MemAccessSize) -> Result<u64, ExecStatus> {
-        self.read_data_impl::<false>(virt_addr, size)
+    #[inline]
+    fn read_data<const SIZE: usize>(&mut self, virt_addr: u64) -> Result<u64, ExecStatus> {
+        self.read_data_impl::<false, SIZE>(virt_addr)
     }
 
     /// Debug data read: kernel-mode override, no breakpoints, no CP0 side-effects.
-    pub fn debug_read(&mut self, virt_addr: u64, size: MemAccessSize) -> Result<u64, ExecStatus> {
-        self.read_data_impl::<true>(virt_addr, size)
+    pub fn debug_read(&mut self, virt_addr: u64, size: usize) -> Result<u64, ExecStatus> {
+        match size {
+            1 => self.read_data_impl::<true, 1>(virt_addr),
+            2 => self.read_data_impl::<true, 2>(virt_addr),
+            4 => self.read_data_impl::<true, 4>(virt_addr),
+            8 => self.read_data_impl::<true, 8>(virt_addr),
+            _ => Err(exec_exception(EXC_ADEL)),
+        }
     }
 
     /// Core data read.  When `DEBUG=true`:
@@ -1555,15 +1551,15 @@ For R4000SC/MC CPUs:
     /// - Breakpoint checks are skipped
     /// - cp0_badvaddr is never written
     #[inline]
-    fn read_data_impl<const DEBUG: bool>(&mut self, virt_addr: u64, size: MemAccessSize) -> Result<u64, ExecStatus> {
+    fn read_data_impl<const DEBUG: bool, const SIZE: usize>(&mut self, virt_addr: u64) -> Result<u64, ExecStatus> {
+        const { assert!(SIZE == 1 || SIZE == 2 || SIZE == 4 || SIZE == 8, "invalid memory access SIZE") };
         #[cfg(not(feature = "lightning"))]
         if !DEBUG && self.bp_enabled() && self.check_breakpoint::<{ BpType::VirtRead as u8 }>(virt_addr) {
             return Err(EXEC_BREAKPOINT);
         }
 
         // Check alignment
-        let align_mask = size.align_mask();
-        if (virt_addr & align_mask) != 0 {
+        if (virt_addr & align_mask_for::<SIZE>()) != 0 {
             if !DEBUG { self.core.cp0_badvaddr = virt_addr; }
             return Err(exec_exception(EXC_ADEL));
         }
@@ -1580,14 +1576,13 @@ For R4000SC/MC CPUs:
             let is_cached = translate_result.is_cached();
 
             if is_cached {
-                    // Cached access uses D-Cache - use appropriate width
+                    // Cached access uses D-Cache
                     #[cfg(not(feature = "lightning"))]
                     if !DEBUG && self.bp_enabled() && self.check_breakpoint::<{ BpType::PhysRead as u8 }>(phys_addr) {
                         return Err(EXEC_BREAKPOINT);
                     }
 
-                    let nbytes = size.bytes();
-                    let r = self.cache.read(virt_addr, phys_addr, nbytes);
+                    let r = self.cache.read(virt_addr, phys_addr, SIZE);
                     if r.is_ok() {
                         Ok(r.data)
                     } else {
@@ -1595,24 +1590,30 @@ For R4000SC/MC CPUs:
                         Err(r.status) // BUS_BUSY, BUS_VCE, or BUS_ERR — all valid ExecStatus
                     }
                 } else {
-                    // Uncached access - use appropriate width
+                    // Uncached access
                     #[cfg(not(feature = "lightning"))]
                     if !DEBUG && self.bp_enabled() && self.check_breakpoint::<{ BpType::PhysRead as u8 }>(phys_addr) {
                         return Err(EXEC_BREAKPOINT);
                     }
 
                     let res = {
-                        let r = match size {
-                            MemAccessSize::Byte   => { let r = self.sysad.read8(phys_addr as u32);  BusRead64 { status: r.status, data: r.data as u64 } }
-                            MemAccessSize::Half   => { let r = self.sysad.read16(phys_addr as u32); BusRead64 { status: r.status, data: r.data as u64 } }
-                            MemAccessSize::Word   => { let r = self.sysad.read32(phys_addr as u32); BusRead64 { status: r.status, data: r.data as u64 } }
-                            MemAccessSize::Double =>   self.sysad.read64(phys_addr as u32),
+                        let r = if SIZE == 1 {
+                            let r = self.sysad.read8(phys_addr as u32);
+                            BusRead64 { status: r.status, data: r.data as u64 }
+                        } else if SIZE == 2 {
+                            let r = self.sysad.read16(phys_addr as u32);
+                            BusRead64 { status: r.status, data: r.data as u64 }
+                        } else if SIZE == 4 {
+                            let r = self.sysad.read32(phys_addr as u32);
+                            BusRead64 { status: r.status, data: r.data as u64 }
+                        } else {
+                            self.sysad.read64(phys_addr as u32)
                         };
                         if r.is_ok() {
                             Ok(r.data)
                         } else {
                             if r.status != BUS_BUSY {
-                                eprintln!("Bus error on uncached read{}: PC={:016x} VA={:016x} PA={:016x} status={:08x}", size.bytes()*8, self.core.pc, virt_addr, phys_addr, r.status);
+                                eprintln!("Bus error on uncached read{}: PC={:016x} VA={:016x} PA={:016x} status={:08x}", SIZE*8, self.core.pc, virt_addr, phys_addr, r.status);
                                 if !DEBUG { self.core.cp0_badvaddr = virt_addr; }
                             }
                             Err(r.status) // BUS_BUSY or BUS_ERR — both valid ExecStatus
@@ -1621,8 +1622,8 @@ For R4000SC/MC CPUs:
 
                     if !DEBUG && mips_log(MIPS_LOG_MEM) {
                         match res {
-                            Ok(val) => dlog_dev!(LogModule::Mips, "Uncached Read {:?}: PC={:016x} VA={:016x} PA={:016x} Val={:016x}", size, self.core.pc, virt_addr, phys_addr, val),
-                            Err(_) => dlog_dev!(LogModule::Mips, "Uncached Read {:?}: PC={:016x} VA={:016x} PA={:016x} Error", size, self.core.pc, virt_addr, phys_addr),
+                            Ok(val) => dlog_dev!(LogModule::Mips, "Uncached Read{}: PC={:016x} VA={:016x} PA={:016x} Val={:016x}", SIZE*8, self.core.pc, virt_addr, phys_addr, val),
+                            Err(_) => dlog_dev!(LogModule::Mips, "Uncached Read{}: PC={:016x} VA={:016x} PA={:016x} Error", SIZE*8, self.core.pc, virt_addr, phys_addr),
                         }
                     }
                     res
@@ -1631,13 +1632,20 @@ For R4000SC/MC CPUs:
     }
 
     /// Production data write (with breakpoints, undo tracking, updates CP0 state on exceptions).
-    fn write_data(&mut self, virt_addr: u64, val: u64, size: MemAccessSize, mask: u64) -> ExecStatus {
-        self.write_data_impl::<false>(virt_addr, val, size, mask)
+    #[inline]
+    fn write_data<const SIZE: usize>(&mut self, virt_addr: u64, val: u64, mask: u64) -> ExecStatus {
+        self.write_data_impl::<false, SIZE>(virt_addr, val, mask)
     }
 
     /// Debug data write: kernel-mode override, no breakpoints, no undo tracking, no CP0 side-effects.
-    pub fn debug_write(&mut self, virt_addr: u64, val: u64, size: MemAccessSize, mask: u64) -> ExecStatus {
-        self.write_data_impl::<true>(virt_addr, val, size, mask)
+    pub fn debug_write(&mut self, virt_addr: u64, val: u64, size: usize, mask: u64) -> ExecStatus {
+        match size {
+            1 => self.write_data_impl::<true, 1>(virt_addr, val, mask),
+            2 => self.write_data_impl::<true, 2>(virt_addr, val, mask),
+            4 => self.write_data_impl::<true, 4>(virt_addr, val, mask),
+            8 => self.write_data_impl::<true, 8>(virt_addr, val, mask),
+            _ => exec_exception(EXC_ADES),
+        }
     }
 
     /// Core data write.  When `DEBUG=true`:
@@ -1646,15 +1654,15 @@ For R4000SC/MC CPUs:
     /// - cp0_badvaddr is never written
     /// - Undo buffer tracking is skipped
     #[inline]
-    fn write_data_impl<const DEBUG: bool>(&mut self, virt_addr: u64, val: u64, size: MemAccessSize, mask: u64) -> ExecStatus {
+    fn write_data_impl<const DEBUG: bool, const SIZE: usize>(&mut self, virt_addr: u64, val: u64, mask: u64) -> ExecStatus {
+        const { assert!(SIZE == 1 || SIZE == 2 || SIZE == 4 || SIZE == 8, "invalid memory access SIZE") };
         #[cfg(not(feature = "lightning"))]
         if !DEBUG && self.bp_enabled() && self.check_breakpoint::<{ BpType::VirtWrite as u8 }>(virt_addr) {
             return EXEC_BREAKPOINT;
         }
 
         // Check alignment
-        let align_mask = size.align_mask();
-        if (virt_addr & align_mask) != 0 {
+        if (virt_addr & align_mask_for::<SIZE>()) != 0 {
             if !DEBUG { self.core.cp0_badvaddr = virt_addr; }
             return exec_exception(EXC_ADES);
         }
@@ -1679,15 +1687,15 @@ For R4000SC/MC CPUs:
 
                     if is_main_memory {
                         // Read the old value before writing
-                        let old_value = match self.read_data(virt_addr, size) {
+                        let old_value = match self.read_data::<SIZE>(virt_addr) {
                             Ok(v) => v,
                             Err(_) => 0, // If read fails, just record 0
                         };
-                        self.track_memory_write(virt_addr, phys_addr, old_value, size);
+                        self.track_memory_write(virt_addr, phys_addr, old_value, SIZE);
                     }
                 }
                 if !DEBUG && !is_cached && mips_log(MIPS_LOG_MEM) {
-                    dlog_dev!(LogModule::Mips, "Uncached Write {:?}: PC={:016x} VA={:016x} PA={:016x} Val={:016x} Mask={:016x}", size, self.core.pc, virt_addr, phys_addr, val, mask);
+                    dlog_dev!(LogModule::Mips, "Uncached Write{}: PC={:016x} VA={:016x} PA={:016x} Val={:016x} Mask={:016x}", SIZE*8, self.core.pc, virt_addr, phys_addr, val, mask);
                 }
 
                 if is_cached {
@@ -1702,29 +1710,27 @@ For R4000SC/MC CPUs:
                         return EXEC_BREAKPOINT;
                     }
 
-                    let status = match size {
-                        MemAccessSize::Byte => self.cache.write8(virt_addr, phys_addr, val as u8),
-                        MemAccessSize::Half => self.cache.write16(virt_addr, phys_addr, val as u16),
-                        MemAccessSize::Word => {
-                            // SWL/SWR pass a partial mask for a word-aligned address.
-                            // write32 computes its own internal mask; go through
-                            // write64_masked so the caller's mask is used directly.
-                            let full_word_mask = 0xFFFFFFFFu64;
-                            if mask == full_word_mask {
-                                self.cache.write32(virt_addr, phys_addr, val as u32)
-                            } else {
-                                // Convert word mask to doubleword mask in the correct half
-                                let aligned8 = phys_addr & !7;
-                                let half = (phys_addr & 4) as usize; // 0 or 4
-                                let shift = (4 - half) << 3; // 32 for upper, 0 for lower
-                                self.cache.write64_masked(virt_addr, aligned8,
-                                    val << shift, mask << shift)
-                            }
+                    let status = if SIZE == 1 {
+                        self.cache.write8(virt_addr, phys_addr, val as u8)
+                    } else if SIZE == 2 {
+                        self.cache.write16(virt_addr, phys_addr, val as u16)
+                    } else if SIZE == 4 {
+                        // SWL/SWR pass a partial mask for a word-aligned address.
+                        // write32 computes its own internal mask; go through
+                        // write64_masked so the caller's mask is used directly.
+                        if mask == 0xFFFF_FFFFu64 {
+                            self.cache.write32(virt_addr, phys_addr, val as u32)
+                        } else {
+                            // Convert word mask to doubleword mask in the correct half
+                            let aligned8 = phys_addr & !7;
+                            let half = (phys_addr & 4) as usize; // 0 or 4
+                            let shift = (4 - half) << 3; // 32 for upper, 0 for lower
+                            self.cache.write64_masked(virt_addr, aligned8,
+                                val << shift, mask << shift)
                         }
-                        MemAccessSize::Double => {
-                            // SDL/SDR pass an arbitrary 64-bit mask.
-                            self.cache.write64_masked(virt_addr, phys_addr, val, mask)
-                        }
+                    } else {
+                        // SIZE == 8: SDL/SDR pass an arbitrary 64-bit mask.
+                        self.cache.write64_masked(virt_addr, phys_addr, val, mask)
                     };
                     // status is already a valid ExecStatus (BUS_OK/BUSY/VCE/ERR)
                     if status != BUS_OK && status != BUS_BUSY {
@@ -1740,19 +1746,20 @@ For R4000SC/MC CPUs:
                         return EXEC_BREAKPOINT;
                     }
 
-                    let full_mask: u64 = size.full_mask();
-
-                    if mask == full_mask {
+                    if mask == full_mask_for::<SIZE>() {
                         // Fast path: normal full-width store
-                        let ws = match size {
-                            MemAccessSize::Byte   => self.sysad.write8(phys_addr as u32, val as u8),
-                            MemAccessSize::Half   => self.sysad.write16(phys_addr as u32, val as u16),
-                            MemAccessSize::Word   => self.sysad.write32(phys_addr as u32, val as u32),
-                            MemAccessSize::Double => self.sysad.write64(phys_addr as u32, val),
+                        let ws = if SIZE == 1 {
+                            self.sysad.write8(phys_addr as u32, val as u8)
+                        } else if SIZE == 2 {
+                            self.sysad.write16(phys_addr as u32, val as u16)
+                        } else if SIZE == 4 {
+                            self.sysad.write32(phys_addr as u32, val as u32)
+                        } else {
+                            self.sysad.write64(phys_addr as u32, val)
                         };
                         if ws != BUS_OK {
                             if ws != BUS_BUSY {
-                                eprintln!("Bus error on uncached write{}: PC={:016x} VA={:016x} PA={:016x} val={:016x} status={:08x}", size.bytes()*8, self.core.pc, virt_addr, phys_addr, val, ws);
+                                eprintln!("Bus error on uncached write{}: PC={:016x} VA={:016x} PA={:016x} val={:016x} status={:08x}", SIZE*8, self.core.pc, virt_addr, phys_addr, val, ws);
                             }
                         }
                         ws // already a valid ExecStatus
@@ -1762,10 +1769,9 @@ For R4000SC/MC CPUs:
                         //   Double: bit 63 = byte 0 (MSB), bit 0 = byte 7
                         //   Word:   bit 31 = byte 0 (MSB), bit 0 = byte 3
                         //   Half:   bit 15 = byte 0 (MSB), bit 0 = byte 1
-                        let nbytes = size.bytes();
-                        for i in 0..nbytes {
+                        for i in 0..SIZE {
                             // bit position of byte i within the size-wide value
-                            let bit = nbytes - 1 - i; // byte 0 -> bit nbytes-1, last byte -> bit 0
+                            let bit = SIZE - 1 - i; // byte 0 -> bit SIZE-1, last byte -> bit 0
                             let byte_mask = (mask >> (bit * 8)) & 0xFF;
                             if byte_mask != 0 {
                                 let byte_val = (val >> (bit * 8)) as u8;
@@ -2479,7 +2485,7 @@ For R4000SC/MC CPUs:
         let virt_addr = base.wrapping_add(d.immu64());
         let rt_reg = d.rt as u32;
 
-        match self.read_data(virt_addr, MemAccessSize::Byte) {
+        match self.read_data::<1>(virt_addr) {
             Ok(value) => {
                 // Sign-extend byte to 64 bits
                 self.core.write_gpr(rt_reg, value as i8 as i64 as u64);
@@ -2495,10 +2501,9 @@ For R4000SC/MC CPUs:
         let virt_addr = base.wrapping_add(d.immu64());
         let rt_reg = d.rt as u32;
 
-        match self.read_data(virt_addr, MemAccessSize::Byte) {
+        match self.read_data::<1>(virt_addr) {
             Ok(value) => {
-                // Zero-extend byte to 64 bits
-                self.core.write_gpr(rt_reg, (value & 0xFF) as u64);
+                self.core.write_gpr(rt_reg, value);
                 EXEC_COMPLETE
             }
             Err(status) => status
@@ -2511,7 +2516,7 @@ For R4000SC/MC CPUs:
         let virt_addr = base.wrapping_add(d.immu64());
         let rt_reg = d.rt as u32;
 
-        match self.read_data(virt_addr, MemAccessSize::Half) {
+        match self.read_data::<2>(virt_addr) {
             Ok(value) => {
                 // Sign-extend halfword to 64 bits
                 self.core.write_gpr(rt_reg, value as i16 as i64 as u64);
@@ -2527,10 +2532,9 @@ For R4000SC/MC CPUs:
         let virt_addr = base.wrapping_add(d.immu64());
         let rt_reg = d.rt as u32;
 
-        match self.read_data(virt_addr, MemAccessSize::Half) {
+        match self.read_data::<2>(virt_addr) {
             Ok(value) => {
-                // Zero-extend halfword to 64 bits
-                self.core.write_gpr(rt_reg, (value & 0xFFFF) as u64);
+                self.core.write_gpr(rt_reg, value);
                 EXEC_COMPLETE
             }
             Err(status) => status
@@ -2543,7 +2547,7 @@ For R4000SC/MC CPUs:
         let virt_addr = base.wrapping_add(d.immu64());
         let rt_reg = d.rt as u32;
 
-        match self.read_data(virt_addr, MemAccessSize::Word) {
+        match self.read_data::<4>(virt_addr) {
             Ok(value) => {
                 // Sign-extend word to 64 bits
                 self.core.write_gpr(rt_reg, value as i32 as i64 as u64);
@@ -2559,7 +2563,7 @@ For R4000SC/MC CPUs:
         let virt_addr = base.wrapping_add(d.immu64());
         let rt_reg = d.rt as u32;
 
-        match self.read_data(virt_addr, MemAccessSize::Word) {
+        match self.read_data::<4>(virt_addr) {
             Ok(value) => {
                 // Zero-extend word to 64 bits
                 self.core.write_gpr(rt_reg, value as u64);
@@ -2575,7 +2579,7 @@ For R4000SC/MC CPUs:
         let virt_addr = base.wrapping_add(d.immu64());
         let rt_reg = d.rt as u32;
 
-        match self.read_data(virt_addr, MemAccessSize::Double) {
+        match self.read_data::<8>(virt_addr) {
             Ok(value) => {
                 self.core.write_gpr(rt_reg, value);
                 EXEC_COMPLETE
@@ -2590,7 +2594,7 @@ For R4000SC/MC CPUs:
         let virt_addr = base.wrapping_add(d.immu64());
         let rt_val = self.core.read_gpr(d.rt as u32);
 
-        self.write_data(virt_addr, rt_val, MemAccessSize::Byte, 0xFF)
+        self.write_data::<1>(virt_addr, rt_val, 0xFF)
     }
 
     // SH - Store Halfword
@@ -2599,7 +2603,7 @@ For R4000SC/MC CPUs:
         let virt_addr = base.wrapping_add(d.immu64());
         let rt_val = self.core.read_gpr(d.rt as u32);
 
-        self.write_data(virt_addr, rt_val, MemAccessSize::Half, 0xFFFF)
+        self.write_data::<2>(virt_addr, rt_val, 0xFFFF)
     }
 
     // SW - Store Word
@@ -2608,7 +2612,7 @@ For R4000SC/MC CPUs:
         let virt_addr = base.wrapping_add(d.immu64());
         let rt_val = self.core.read_gpr(d.rt as u32);
 
-        self.write_data(virt_addr, rt_val, MemAccessSize::Word, 0xFFFFFFFF)
+        self.write_data::<4>(virt_addr, rt_val, 0xFFFFFFFF)
     }
 
     // SD - Store Doubleword (MIPS III, 64-bit)
@@ -2617,7 +2621,7 @@ For R4000SC/MC CPUs:
         let virt_addr = base.wrapping_add(d.immu64());
         let rt_val = self.core.read_gpr(d.rt as u32);
 
-        self.write_data(virt_addr, rt_val, MemAccessSize::Double, 0xFFFFFFFFFFFFFFFF)
+        self.write_data::<8>(virt_addr, rt_val, 0xFFFFFFFFFFFFFFFF)
     }
 
     // LWL - Load Word Left
@@ -2633,7 +2637,7 @@ For R4000SC/MC CPUs:
         let byte_offset = (virt_addr & 3) as usize;
 
         // Read the aligned word
-        match self.read_data(aligned_addr, MemAccessSize::Word) {
+        match self.read_data::<4>(aligned_addr) {
             Ok(mem_word) => {
                 let mem_word = mem_word as u32;
                 let rt_val = self.core.read_gpr(rt_reg) as u32;
@@ -2670,7 +2674,7 @@ For R4000SC/MC CPUs:
         let byte_offset = (virt_addr & 3) as usize;
 
         // Read the aligned word
-        match self.read_data(aligned_addr, MemAccessSize::Word) {
+        match self.read_data::<4>(aligned_addr) {
             Ok(mem_word) => {
                 let mem_word = mem_word as u32;
                 let rt_val = self.core.read_gpr(rt_reg) as u32;
@@ -2715,7 +2719,7 @@ For R4000SC/MC CPUs:
         let mask = 0xFFFFFFFFu32 >> shift;
         let value = rt_val >> shift;
 
-        self.write_data(aligned_addr, value as u64, MemAccessSize::Word, mask as u64)
+        self.write_data::<4>(aligned_addr, value as u64, mask as u64)
     }
 
     // SWR - Store Word Right
@@ -2739,7 +2743,7 @@ For R4000SC/MC CPUs:
         let mask = 0xFFFFFFFFu32 << shift;
         let value = rt_val << shift;
 
-        self.write_data(aligned_addr, value as u64, MemAccessSize::Word, mask as u64)
+        self.write_data::<4>(aligned_addr, value as u64, mask as u64)
     }
 
     // LDL - Load Doubleword Left (MIPS III)
@@ -2754,7 +2758,7 @@ For R4000SC/MC CPUs:
         let byte_offset = (virt_addr & 7) as usize;
 
         // Read the aligned doubleword
-        match self.read_data(aligned_addr, MemAccessSize::Double) {
+        match self.read_data::<8>(aligned_addr) {
             Ok(mem_dword) => {
                 let rt_val = self.core.read_gpr(rt_reg);
 
@@ -2784,7 +2788,7 @@ For R4000SC/MC CPUs:
         let byte_offset = (virt_addr & 7) as usize;
 
         // Read the aligned doubleword
-        match self.read_data(aligned_addr, MemAccessSize::Double) {
+        match self.read_data::<8>(aligned_addr) {
             Ok(mem_dword) => {
                 let rt_val = self.core.read_gpr(rt_reg);
 
@@ -2818,7 +2822,7 @@ For R4000SC/MC CPUs:
         let mask = 0xFFFFFFFFFFFFFFFFu64 >> shift;
         let value = rt_val >> shift;
 
-        self.write_data(aligned_addr, value, MemAccessSize::Double, mask)
+        self.write_data::<8>(aligned_addr, value, mask)
     }
 
     // SDR - Store Doubleword Right (MIPS III)
@@ -2837,7 +2841,7 @@ For R4000SC/MC CPUs:
         let mask = 0xFFFFFFFFFFFFFFFFu64 << shift;
         let value = rt_val << shift;
 
-        self.write_data(aligned_addr, value, MemAccessSize::Double, mask)
+        self.write_data::<8>(aligned_addr, value, mask)
     }
 
 
@@ -2902,7 +2906,7 @@ For R4000SC/MC CPUs:
         let virt_addr = base.wrapping_add(d.immu64());
         let rt_reg = d.rt as u32;
 
-        match self.read_data(virt_addr, MemAccessSize::Word) {
+        match self.read_data::<4>(virt_addr) {
             Ok(value) => {
                 // Sign-extend word to 64 bits
                 self.core.write_gpr(rt_reg, value as i32 as i64 as u64);
@@ -2944,7 +2948,7 @@ For R4000SC/MC CPUs:
         let ll_addr = (self.cache.get_lladdr() as u64) << 4;
         if (phys_addr & !0xF) == ll_addr {
             let value = self.core.read_gpr(rt_reg);
-            let status = self.write_data(virt_addr, value, MemAccessSize::Word, 0xFFFFFFFF);
+            let status = self.write_data::<4>(virt_addr, value, 0xFFFFFFFF);
             if status == EXEC_COMPLETE {
                 self.core.write_gpr(rt_reg, 1);
                 self.cache.set_llbit(false);
@@ -2963,7 +2967,7 @@ For R4000SC/MC CPUs:
         let virt_addr = base.wrapping_add(d.immu64());
         let rt_reg = d.rt as u32;
 
-        match self.read_data(virt_addr, MemAccessSize::Double) {
+        match self.read_data::<8>(virt_addr) {
             Ok(value) => {
                 self.core.write_gpr(rt_reg, value);
                 // Store physical address in LLAddr register
@@ -3004,7 +3008,7 @@ For R4000SC/MC CPUs:
         if (phys_addr & !0xF) == ll_addr {
             // Attempt the store
             let value = self.core.read_gpr(rt_reg);
-            let status = self.write_data(virt_addr, value, MemAccessSize::Double, 0xFFFFFFFFFFFFFFFF);
+            let status = self.write_data::<8>(virt_addr, value, 0xFFFFFFFFFFFFFFFF);
             if status == EXEC_COMPLETE {
                 self.core.write_gpr(rt_reg, 1);
                 self.cache.set_llbit(false);
@@ -3831,7 +3835,7 @@ For R4000SC/MC CPUs:
         let index = self.core.read_gpr(d.rt as u32);
         let addr = base.wrapping_add(index);
         let fd_reg = d.sa as u32;
-        match self.read_data(addr, MemAccessSize::Word) {
+        match self.read_data::<4>(addr) {
             Ok(val) => { (self.fpr_write_w)(&mut self.core, fd_reg, val as u32); EXEC_COMPLETE }
             Err(status) => status,
         }
@@ -3842,7 +3846,7 @@ For R4000SC/MC CPUs:
         let index = self.core.read_gpr(d.rt as u32);
         let addr = base.wrapping_add(index);
         let fd_reg = d.sa as u32;
-        match self.read_data(addr, MemAccessSize::Double) {
+        match self.read_data::<8>(addr) {
             Ok(val) => { (self.fpr_write_l)(&mut self.core, fd_reg, val); EXEC_COMPLETE }
             Err(status) => status,
         }
@@ -3854,7 +3858,7 @@ For R4000SC/MC CPUs:
         let addr = base.wrapping_add(index);
         let fs_reg = d.rd as u32;
         let val = (self.fpr_read_w)(&self.core, fs_reg) as u64;
-        self.write_data(addr, val, MemAccessSize::Word, 0xFFFFFFFF)
+        self.write_data::<4>(addr, val, 0xFFFFFFFF)
     }
     fn exec_sdxc1(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
@@ -3863,7 +3867,7 @@ For R4000SC/MC CPUs:
         let addr = base.wrapping_add(index);
         let fs_reg = d.rd as u32;
         let val = (self.fpr_read_l)(&self.core, fs_reg);
-        self.write_data(addr, val, MemAccessSize::Double, 0xFFFFFFFFFFFFFFFF)
+        self.write_data::<8>(addr, val, 0xFFFFFFFFFFFFFFFF)
     }
     fn exec_prefx(&mut self, _d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
@@ -3966,7 +3970,7 @@ For R4000SC/MC CPUs:
         let ft_reg = d.rt as u32;
 
         // Load word from memory (alignment check done by read_data)
-        match self.read_data(addr, MemAccessSize::Word) {
+        match self.read_data::<4>(addr) {
             Ok(value) => {
                 (self.fpr_write_w)(&mut self.core, ft_reg, value as u32);
                 EXEC_COMPLETE
@@ -3987,7 +3991,7 @@ For R4000SC/MC CPUs:
         let ft_reg = d.rt as u32;
 
         // Load doubleword from memory (alignment check done by read_data)
-        match self.read_data(addr, MemAccessSize::Double) {
+        match self.read_data::<8>(addr) {
             Ok(value) => {
                 (self.fpr_write_l)(&mut self.core, ft_reg, value);
                 EXEC_COMPLETE
@@ -4010,7 +4014,7 @@ For R4000SC/MC CPUs:
         let value = (self.fpr_read_w)(&self.core, ft_reg) as u64;
 
         // Store word to memory (alignment check done by write_data)
-        self.write_data(addr, value, MemAccessSize::Word, 0xFFFFFFFF)
+        self.write_data::<4>(addr, value, 0xFFFFFFFF)
     }
 
     // SDC1 - Store Doubleword from FPU
@@ -4027,7 +4031,7 @@ For R4000SC/MC CPUs:
         let value = (self.fpr_read_l)(&self.core, ft_reg);
 
         // Store doubleword to memory (alignment check done by write_data)
-        self.write_data(addr, value, MemAccessSize::Double, 0xFFFFFFFF_FFFFFFFF)
+        self.write_data::<8>(addr, value, 0xFFFFFFFF_FFFFFFFF)
     }
 
     // FPU single-precision comparison
@@ -4182,7 +4186,7 @@ For R4000SC/MC CPUs:
 
     /// Track a memory write for potential undo
     #[cfg(feature = "developer")]
-    fn track_memory_write(&mut self, virt_addr: u64, phys_addr: u64, old_value: u64, size: MemAccessSize) {
+    fn track_memory_write(&mut self, virt_addr: u64, phys_addr: u64, old_value: u64, size: usize) {
         if !self.undo_buffer.is_enabled() {
             return;
         }
@@ -5426,7 +5430,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
                 
                 for i in 0..count {
                     let curr_addr = addr.wrapping_add(i * 4);
-                    match exec.debug_read(curr_addr, MemAccessSize::Word) {
+                    match exec.debug_read(curr_addr, 4) {
                         Ok(val) => writeln!(writer, "{:016x}: {:08x}", curr_addr, val).unwrap(),
                         Err(e) => writeln!(writer, "{:016x}: Error {:?}", curr_addr, e).unwrap(),
                     }
@@ -5449,7 +5453,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
                 
                 for i in 0..count {
                     let curr_addr = addr.wrapping_add(i * 8); // 64-bit stack slots usually
-                    match exec.debug_read(curr_addr, MemAccessSize::Double) {
+                    match exec.debug_read(curr_addr, 8) {
                         Ok(val) => writeln!(writer, "{:016x}: {:016x}", curr_addr, val).unwrap(),
                         Err(_) => writeln!(writer, "{:016x}: ????????????????", curr_addr).unwrap(),
                     }
@@ -5471,19 +5475,19 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
                     .or_else(|_| actual_args[1].parse::<u64>())
                     .map_err(|_| "Invalid value".to_string())?;
                 
-                let size = if actual_args.len() > 2 {
+                let size: usize = if actual_args.len() > 2 {
                     match actual_args[2] {
-                        "b" | "byte" => MemAccessSize::Byte,
-                        "h" | "half" => MemAccessSize::Half,
-                        "w" | "word" => MemAccessSize::Word,
-                        "d" | "double" => MemAccessSize::Double,
+                        "b" | "byte" => 1,
+                        "h" | "half" => 2,
+                        "w" | "word" => 4,
+                        "d" | "double" => 8,
                         _ => return Err("Invalid size. Use b, h, w, or d".to_string()),
                     }
                 } else {
-                    MemAccessSize::Word
+                    4
                 };
 
-                let mask = size.full_mask();
+                let mask = full_mask_for_usize(size);
 
                 match exec.debug_write(addr, val, size, mask) {
                     EXEC_COMPLETE => writeln!(writer, "Wrote {:x} to {:016x}", val, addr).unwrap(),
@@ -5507,7 +5511,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
                 let mut bytes = Vec::new();
                 let mut curr = addr;
                 for _ in 0..max_len {
-                    match exec.debug_read(curr, MemAccessSize::Byte) {
+                    match exec.debug_read(curr, 1) {
                         Ok(val) => {
                             let b = val as u8;
                             if b == 0 { break; }
@@ -5777,7 +5781,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
 
 impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
     /// Analyze function prologue to determine frame size and RA save location
-    fn analyze_prologue(&mut self, start_pc: u64, current_pc: u64) -> (u64, Option<(i64, MemAccessSize)>) {
+    fn analyze_prologue(&mut self, start_pc: u64, current_pc: u64) -> (u64, Option<(i64, usize)>) {
         let mut frame_size = 0u64;
         let mut ra_info = None;
         
@@ -5804,11 +5808,11 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
             }
             // SW ra, offset(sp) (0x2B)
             else if op == 0x2B && rs == 29 && rt == 31 {
-                ra_info = Some((imm as i64, MemAccessSize::Word));
+                ra_info = Some((imm as i64, 4usize));
             }
             // SD ra, offset(sp) (0x3F)
             else if op == 0x3F && rs == 29 && rt == 31 {
-                ra_info = Some((imm as i64, MemAccessSize::Double));
+                ra_info = Some((imm as i64, 8usize));
             }
 
             pc += 4;
