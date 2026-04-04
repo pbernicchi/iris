@@ -414,6 +414,7 @@ impl Ui {
         let window_builder = WindowBuilder::new()
             .with_title("Irresponsible Rust IRIX Simulator")
             .with_resizable(false)
+            .with_enabled_buttons(winit::window::WindowButtons::CLOSE | winit::window::WindowButtons::MINIMIZE)
             .with_inner_size(winit::dpi::PhysicalSize::new(w, h));
 
         let template = ConfigTemplateBuilder::new()
