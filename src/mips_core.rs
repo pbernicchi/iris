@@ -152,12 +152,13 @@ pub struct NanoTlbEntry {
 impl NanoTlbEntry {
     pub const VALID_BIT: u64 = 0x8;
 
+    // Invalidation always zeroes pa_encoded, so nonzero implies VALID_BIT is set.
     #[inline(always)]
-    pub fn is_valid(&self) -> bool { self.pa_encoded & Self::VALID_BIT != 0 }
+    pub fn is_valid(&self) -> bool { self.pa_encoded != 0 }
 
     #[inline(always)]
     pub fn matches(&self, va: u64) -> bool {
-        self.pa_encoded & Self::VALID_BIT != 0 && self.va_tag == (va >> 12)
+        self.pa_encoded != 0 && self.va_tag == (va >> 12)
     }
 
     /// Decode the physical address (page base + page offset).
