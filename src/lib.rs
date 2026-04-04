@@ -1,3 +1,4 @@
+#![allow(dead_code, unused_variables, unused_imports)]
 pub mod config;
 pub mod traits;
 #[macro_use]
