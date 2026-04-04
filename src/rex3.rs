@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, Condvar};
 use spin::Mutex as SpinMutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread;
@@ -878,6 +878,9 @@ pub struct Rex3 {
     pub host_count: UnsafeCell<u32>,
     pub gfifo_producer: SpinMutex<Producer<GFIFOEntry>>,
     pub gfifo_consumer: SpinMutex<Option<Consumer<GFIFOEntry>>>,
+    /// Condvar used to wake the processor thread when work is pushed to the GFIFO.
+    gfifo_ready: Mutex<bool>,
+    gfifo_condvar: Condvar,
 
     pub vc2: Mutex<Vc2>,
     pub xmap0: Mutex<Xmap9>,
@@ -1007,6 +1010,8 @@ impl Rex3 {
             host_count: UnsafeCell::new(0),
             gfifo_producer: SpinMutex::new(producer),
             gfifo_consumer: SpinMutex::new(Some(consumer)),
+            gfifo_ready: Mutex::new(false),
+            gfifo_condvar: Condvar::new(),
             vc2: Mutex::new(Vc2::new()),
             xmap0: Mutex::new(Xmap9::new()),
             xmap1: Mutex::new(Xmap9::new()),
@@ -2701,8 +2706,15 @@ impl Rex3 {
         // push and break write ordering for multi-entry sequences.
         let mut producer = self.gfifo_producer.lock();
         loop {
-            if producer.push(entry).is_ok() { return; }
-            std::hint::spin_loop(); // be little bit nice at least
+            if producer.push(entry).is_ok() {
+                *self.gfifo_ready.lock() = true;
+                self.gfifo_condvar.notify_one();
+                return;
+            }
+            // Buffer full — wake consumer to drain it, then retry.
+            *self.gfifo_ready.lock() = true;
+            self.gfifo_condvar.notify_one();
+            std::hint::spin_loop();
         }
     }
 
@@ -2849,9 +2861,13 @@ impl Rex3 {
 
                 self.gfifo_pending.fetch_sub(1, Ordering::SeqCst);
             } else {
-                // Spin-wait for more entries.
-                // A condvar would be better, but this matches the user request.
-                std::hint::spin_loop();
+                // Wait for the producer to push work. The condvar is notified by
+                // gfifo_push on every successful push and on buffer-full retries.
+                let mut ready = self.gfifo_ready.lock();
+                while !*ready {
+                    self.gfifo_condvar.wait(&mut ready);
+                }
+                *ready = false;
             }
         }
         consumer

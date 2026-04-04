@@ -191,6 +191,14 @@ pub trait Tlb {
     fn power_on(&mut self) {}
     fn save_state(&self) -> toml::Value { toml::Value::Table(Default::default()) }
     fn load_state(&mut self, _v: &toml::Value) -> Result<(), String> { Ok(()) }
+
+    /// Attempt to clone this TLB as a concrete `MipsTlb`.
+    /// Returns `None` for implementations that are not `MipsTlb` (e.g. `PassthroughTlb`).
+    fn clone_as_mips_tlb(&self) -> Option<MipsTlb> { None }
+
+    /// Restore TLB state from a `MipsTlb` snapshot (used by JIT rollback).
+    /// Default no-op for implementations that don't support rollback.
+    fn restore_from_mips_tlb(&mut self, _src: &MipsTlb) {}
 }
 
 /// Sentinel: end of MRU list.
@@ -499,6 +507,10 @@ impl Tlb for MipsTlb {
         }
         Ok(())
     }
+
+    fn clone_as_mips_tlb(&self) -> Option<MipsTlb> { Some(self.clone()) }
+
+    fn restore_from_mips_tlb(&mut self, src: &MipsTlb) { *self = src.clone(); }
 }
 
 /// Passthrough TLB implementation for testing

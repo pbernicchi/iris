@@ -2,6 +2,35 @@
 
 use std::collections::HashMap;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u8)]
+pub enum BlockTier {
+    Alu   = 0,  // ALU + branches only, no memory helper calls
+    Loads = 1,  // ALU + loads + branches
+    Full  = 2,  // ALU + loads + stores + branches
+}
+
+impl BlockTier {
+    pub fn promote(self) -> Option<BlockTier> {
+        match self {
+            BlockTier::Alu   => Some(BlockTier::Loads),
+            BlockTier::Loads => Some(BlockTier::Full),
+            BlockTier::Full  => None,
+        }
+    }
+    pub fn demote(self) -> Option<BlockTier> {
+        match self {
+            BlockTier::Alu   => None,
+            BlockTier::Loads => Some(BlockTier::Alu),
+            BlockTier::Full  => Some(BlockTier::Loads),
+        }
+    }
+}
+
+pub const TIER_STABLE_THRESHOLD:  u32 = 50;   // consecutive clean exits → trusted
+pub const TIER_PROMOTE_THRESHOLD: u32 = 200;  // trusted clean exits → try next tier
+pub const TIER_DEMOTE_THRESHOLD:  u32 = 3;    // exceptions in trial period → demote
+
 /// A compiled native code block.
 pub struct CompiledBlock {
     /// Function pointer to compiled native code.
@@ -14,6 +43,16 @@ pub struct CompiledBlock {
     pub len_mips: u32,
     /// Size of native code in bytes.
     pub len_native: u32,
+    /// Compilation tier for this block.
+    pub tier:            BlockTier,
+    /// Total number of times this block has been entered.
+    pub hit_count:       u32,
+    /// Number of exceptions that occurred during this block's execution.
+    pub exception_count: u32,
+    /// Consecutive clean (non-exception) exits since last exception or tier change.
+    pub stable_hits:     u32,
+    /// True when this block is in a trial period (not yet fully trusted at current tier).
+    pub speculative:     bool,
 }
 
 // Safety: CompiledBlock is only accessed from the CPU thread.
@@ -35,7 +74,15 @@ impl CodeCache {
         self.blocks.get(&phys_pc)
     }
 
+    pub fn lookup_mut(&mut self, phys_pc: u64) -> Option<&mut CompiledBlock> {
+        self.blocks.get_mut(&phys_pc)
+    }
+
     pub fn insert(&mut self, phys_pc: u64, block: CompiledBlock) {
+        self.blocks.insert(phys_pc, block);
+    }
+
+    pub fn replace(&mut self, phys_pc: u64, block: CompiledBlock) {
         self.blocks.insert(phys_pc, block);
     }
 
@@ -55,5 +102,9 @@ impl CodeCache {
 
     pub fn len(&self) -> usize {
         self.blocks.len()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&u64, &CompiledBlock)> {
+        self.blocks.iter()
     }
 }

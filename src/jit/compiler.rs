@@ -11,7 +11,7 @@ use cranelift_module::{Linkage, Module, FuncId};
 use crate::mips_exec::DecodedInstr;
 use crate::mips_isa::*;
 
-use super::cache::CompiledBlock;
+use super::cache::{BlockTier, CompiledBlock};
 use super::context::{JitContext, EXIT_NORMAL, EXIT_INTERPRET, EXIT_EXCEPTION};
 use super::helpers::HelperPtrs;
 
@@ -99,6 +99,7 @@ impl BlockCompiler {
         &mut self,
         instrs: &[(u32, DecodedInstr)],
         block_pc: u64,
+        tier: BlockTier,
     ) -> Option<CompiledBlock> {
         if instrs.is_empty() {
             return None;
@@ -162,6 +163,9 @@ impl BlockCompiler {
         let mut lo = builder.ins().load(types::I64, mem, ctx_ptr,
             ir::immediates::Offset32::new(JitContext::lo_offset()));
 
+        // Bitmask of GPRs modified so far (bits 1-31); used to flush before helper calls
+        let mut modified_gprs: u32 = 0;
+
         // Emit IR for each instruction
         let mut compiled_count = 0u32;
         let mut branch_exit_pc: Option<Value> = None;
@@ -172,7 +176,7 @@ impl BlockCompiler {
             let instr_pc = block_pc.wrapping_add(idx as u64 * 4);
             let result = emit_instruction(
                 &mut builder, ctx_ptr, exec_ptr, &helpers,
-                &mut gpr, &mut hi, &mut lo, d, instr_pc,
+                &mut gpr, &mut hi, &mut lo, &mut modified_gprs, d, instr_pc, tier,
             );
             match result {
                 EmitResult::Ok => { compiled_count += 1; idx += 1; }
@@ -185,7 +189,7 @@ impl BlockCompiler {
                         let delay_pc = block_pc.wrapping_add(idx as u64 * 4);
                         let delay_result = emit_instruction(
                             &mut builder, ctx_ptr, exec_ptr, &helpers,
-                            &mut gpr, &mut hi, &mut lo, delay_d, delay_pc,
+                            &mut gpr, &mut hi, &mut lo, &mut modified_gprs, delay_d, delay_pc, tier,
                         );
                         if matches!(delay_result, EmitResult::Ok) {
                             compiled_count += 1;
@@ -205,11 +209,9 @@ impl BlockCompiler {
             return None;
         }
 
-        // Store GPRs back (skip r0)
-        for i in 1..32usize {
-            builder.ins().store(mem, gpr[i], ctx_ptr,
-                ir::immediates::Offset32::new(JitContext::gpr_offset(i)));
-        }
+        // Store all GPRs that may have changed. Use a full bitmask to ensure completeness.
+        let mut all_modified: u32 = 0xFFFFFFFE; // bits 1-31 set (skip r0)
+        flush_modified_gprs(&mut builder, &gpr, ctx_ptr, &mut all_modified);
 
         // Store hi/lo back
         builder.ins().store(mem, hi, ctx_ptr,
@@ -254,6 +256,11 @@ impl BlockCompiler {
             virt_addr: block_pc,
             len_mips: compiled_count,
             len_native: code_size,
+            tier,
+            speculative: true,
+            hit_count: 0,
+            exception_count: 0,
+            stable_hits: 0,
         })
     }
 }
@@ -283,8 +290,10 @@ fn emit_instruction(
     gpr: &mut [Value; 32],
     hi: &mut Value,
     lo: &mut Value,
+    modified_gprs: &mut u32,
     d: &DecodedInstr,
     instr_pc: u64,
+    tier: BlockTier,
 ) -> EmitResult {
     let op = d.op as u32;
     let rs = d.rs as usize;
@@ -294,30 +303,51 @@ fn emit_instruction(
     let funct = d.funct as u32;
 
     match op {
-        OP_SPECIAL => emit_special(builder, gpr, hi, lo, d, rs, rt, rd, sa, funct),
-        OP_ADDIU  => { emit_addiu(builder, gpr, rs, rt, d); EmitResult::Ok }
-        OP_DADDIU => { emit_daddiu(builder, gpr, rs, rt, d); EmitResult::Ok }
-        OP_SLTI   => { emit_slti(builder, gpr, rs, rt, d); EmitResult::Ok }
-        OP_SLTIU  => { emit_sltiu(builder, gpr, rs, rt, d); EmitResult::Ok }
-        OP_ANDI   => { emit_andi(builder, gpr, rs, rt, d); EmitResult::Ok }
-        OP_ORI    => { emit_ori(builder, gpr, rs, rt, d); EmitResult::Ok }
-        OP_XORI   => { emit_xori(builder, gpr, rs, rt, d); EmitResult::Ok }
-        OP_LUI    => { emit_lui(builder, gpr, rt, d); EmitResult::Ok }
+        OP_SPECIAL => {
+            let result = emit_special(builder, gpr, hi, lo, d, rs, rt, rd, sa, funct);
+            // Conservative: mark rd modified for all SPECIAL ops that return Ok.
+            // Harmless for ops that don't write rd (JR, MTHI, MTLO) since flush
+            // will simply store the still-valid value that was loaded at block entry.
+            if matches!(result, EmitResult::Ok) {
+                *modified_gprs |= 1u32 << rd;
+            }
+            result
+        }
+        OP_ADDIU  => { emit_addiu(builder, gpr, rs, rt, d);  *modified_gprs |= 1 << rt; EmitResult::Ok }
+        OP_DADDIU => { emit_daddiu(builder, gpr, rs, rt, d); *modified_gprs |= 1 << rt; EmitResult::Ok }
+        OP_SLTI   => { emit_slti(builder, gpr, rs, rt, d);   *modified_gprs |= 1 << rt; EmitResult::Ok }
+        OP_SLTIU  => { emit_sltiu(builder, gpr, rs, rt, d);  *modified_gprs |= 1 << rt; EmitResult::Ok }
+        OP_ANDI   => { emit_andi(builder, gpr, rs, rt, d);   *modified_gprs |= 1 << rt; EmitResult::Ok }
+        OP_ORI    => { emit_ori(builder, gpr, rs, rt, d);    *modified_gprs |= 1 << rt; EmitResult::Ok }
+        OP_XORI   => { emit_xori(builder, gpr, rs, rt, d);   *modified_gprs |= 1 << rt; EmitResult::Ok }
+        OP_LUI    => { emit_lui(builder, gpr, rt, d);         *modified_gprs |= 1 << rt; EmitResult::Ok }
 
-        // --- Loads ---
-        OP_LB  => emit_load(builder, ctx_ptr, exec_ptr, helpers.read_u8,  gpr, rs, rt, d, LoadWidth::Byte, true, instr_pc),
-        OP_LBU => emit_load(builder, ctx_ptr, exec_ptr, helpers.read_u8,  gpr, rs, rt, d, LoadWidth::Byte, false, instr_pc),
-        OP_LH  => emit_load(builder, ctx_ptr, exec_ptr, helpers.read_u16, gpr, rs, rt, d, LoadWidth::Half, true, instr_pc),
-        OP_LHU => emit_load(builder, ctx_ptr, exec_ptr, helpers.read_u16, gpr, rs, rt, d, LoadWidth::Half, false, instr_pc),
-        OP_LW  => emit_load(builder, ctx_ptr, exec_ptr, helpers.read_u32, gpr, rs, rt, d, LoadWidth::Word, true, instr_pc),
-        OP_LWU => emit_load(builder, ctx_ptr, exec_ptr, helpers.read_u32, gpr, rs, rt, d, LoadWidth::Word, false, instr_pc),
-        OP_LD  => emit_load(builder, ctx_ptr, exec_ptr, helpers.read_u64, gpr, rs, rt, d, LoadWidth::Double, false, instr_pc),
+        // --- Loads (tier-gated) ---
+        OP_LB | OP_LBU | OP_LH | OP_LHU | OP_LW | OP_LWU | OP_LD => {
+            if tier == BlockTier::Alu { return EmitResult::Stop; }
+            match op {
+                OP_LB  => emit_load(builder, ctx_ptr, exec_ptr, helpers.read_u8,  gpr, rs, rt, d, LoadWidth::Byte,   true,  instr_pc, modified_gprs),
+                OP_LBU => emit_load(builder, ctx_ptr, exec_ptr, helpers.read_u8,  gpr, rs, rt, d, LoadWidth::Byte,   false, instr_pc, modified_gprs),
+                OP_LH  => emit_load(builder, ctx_ptr, exec_ptr, helpers.read_u16, gpr, rs, rt, d, LoadWidth::Half,   true,  instr_pc, modified_gprs),
+                OP_LHU => emit_load(builder, ctx_ptr, exec_ptr, helpers.read_u16, gpr, rs, rt, d, LoadWidth::Half,   false, instr_pc, modified_gprs),
+                OP_LW  => emit_load(builder, ctx_ptr, exec_ptr, helpers.read_u32, gpr, rs, rt, d, LoadWidth::Word,   true,  instr_pc, modified_gprs),
+                OP_LWU => emit_load(builder, ctx_ptr, exec_ptr, helpers.read_u32, gpr, rs, rt, d, LoadWidth::Word,   false, instr_pc, modified_gprs),
+                OP_LD  => emit_load(builder, ctx_ptr, exec_ptr, helpers.read_u64, gpr, rs, rt, d, LoadWidth::Double, false, instr_pc, modified_gprs),
+                _ => unreachable!(),
+            }
+        }
 
-        // --- Stores ---
-        OP_SB => emit_store(builder, ctx_ptr, exec_ptr, helpers.write_u8,  gpr, rs, rt, d, instr_pc),
-        OP_SH => emit_store(builder, ctx_ptr, exec_ptr, helpers.write_u16, gpr, rs, rt, d, instr_pc),
-        OP_SW => emit_store(builder, ctx_ptr, exec_ptr, helpers.write_u32, gpr, rs, rt, d, instr_pc),
-        OP_SD => emit_store(builder, ctx_ptr, exec_ptr, helpers.write_u64, gpr, rs, rt, d, instr_pc),
+        // --- Stores (tier-gated) ---
+        OP_SB | OP_SH | OP_SW | OP_SD => {
+            if tier == BlockTier::Alu || tier == BlockTier::Loads { return EmitResult::Stop; }
+            match op {
+                OP_SB => emit_store(builder, ctx_ptr, exec_ptr, helpers.write_u8,  gpr, rs, rt, d, instr_pc, modified_gprs),
+                OP_SH => emit_store(builder, ctx_ptr, exec_ptr, helpers.write_u16, gpr, rs, rt, d, instr_pc, modified_gprs),
+                OP_SW => emit_store(builder, ctx_ptr, exec_ptr, helpers.write_u32, gpr, rs, rt, d, instr_pc, modified_gprs),
+                OP_SD => emit_store(builder, ctx_ptr, exec_ptr, helpers.write_u64, gpr, rs, rt, d, instr_pc, modified_gprs),
+                _ => unreachable!(),
+            }
+        }
 
         // --- Branches ---
         OP_BEQ   => emit_beq(builder, gpr, rs, rt, d, instr_pc, false),
@@ -327,7 +357,7 @@ fn emit_instruction(
 
         // --- Jumps ---
         OP_J   => emit_j(builder, gpr, d, instr_pc),
-        OP_JAL => emit_jal(builder, gpr, d, instr_pc),
+        OP_JAL => { *modified_gprs |= 1 << 31; emit_jal(builder, gpr, d, instr_pc) }
 
         _ => EmitResult::Stop,
     }
@@ -712,6 +742,30 @@ fn emit_movn(builder: &mut FunctionBuilder, gpr: &mut [Value; 32], rs: usize, rt
     gpr[rd] = builder.ins().select(is_nonzero, gpr[rs], gpr[rd]);
 }
 
+// ─── GPR flush helper ────────────────────────────────────────────────────────
+
+/// Flush modified GPRs from SSA values to JitContext memory.
+/// Called immediately BEFORE each `builder.ins().call(helper, ...)`.
+/// After flushing, `*modified` is reset to 0.
+/// This eliminates cross-block SSA live value pressure on x86_64 (the "35+ live I64" spill bug).
+fn flush_modified_gprs(
+    builder: &mut FunctionBuilder,
+    gpr: &[Value; 32],
+    ctx_ptr: Value,
+    modified: &mut u32,
+) {
+    let mem = MemFlags::trusted();
+    for i in 1..32usize {
+        if (*modified >> i) & 1 != 0 {
+            builder.ins().store(
+                mem, gpr[i], ctx_ptr,
+                ir::immediates::Offset32::new(JitContext::gpr_offset(i)),
+            );
+        }
+    }
+    *modified = 0;
+}
+
 // ─── Load/Store emitters ─────────────────────────────────────────────────────
 
 /// Load width tag passed to emit_load so it applies the correct sign extension.
@@ -730,10 +784,14 @@ fn emit_load(
     width: LoadWidth,
     sign_extend: bool,
     instr_pc: u64,
+    modified_gprs: &mut u32,
 ) -> EmitResult {
     let base = gpr[rs];
     let offset = builder.ins().iconst(types::I64, d.imm as i32 as i64);
     let virt_addr = builder.ins().iadd(base, offset);
+
+    // Flush all GPRs modified so far — prevents cross-block SSA live value pressure
+    flush_modified_gprs(builder, gpr, ctx_ptr, modified_gprs);
 
     // Store faulting PC to ctx BEFORE the helper call, so the dispatch loop
     // knows which instruction caused the exception if one occurs.
@@ -757,14 +815,9 @@ fn emit_load(
     let exc_block = builder.create_block();
     builder.ins().brif(is_exception, exc_block, &[], ok_block, &[raw_val]);
 
-    // Exception path: store all GPRs back to ctx so sync_to has current state
+    // Exception path: GPRs already flushed before the helper call — just return
     builder.switch_to_block(exc_block);
     builder.seal_block(exc_block);
-    let mem = MemFlags::trusted();
-    for i in 1..32usize {
-        builder.ins().store(mem, gpr[i], ctx_ptr,
-            ir::immediates::Offset32::new(JitContext::gpr_offset(i)));
-    }
     builder.ins().return_(&[]);
 
     // Normal path — raw_val comes through as a block parameter
@@ -793,6 +846,7 @@ fn emit_load(
             val
         }
     };
+    *modified_gprs |= 1u32 << rt;
 
     EmitResult::Ok
 }
@@ -806,11 +860,15 @@ fn emit_store(
     rs: usize, rt: usize,
     d: &DecodedInstr,
     instr_pc: u64,
+    modified_gprs: &mut u32,
 ) -> EmitResult {
     let base = gpr[rs];
     let offset = builder.ins().iconst(types::I64, d.imm as i32 as i64);
     let virt_addr = builder.ins().iadd(base, offset);
     let value = gpr[rt];
+
+    // Flush all GPRs modified so far — prevents cross-block SSA live value pressure
+    flush_modified_gprs(builder, gpr, ctx_ptr, modified_gprs);
 
     // Store faulting PC before helper call
     let instr_pc_val = builder.ins().iconst(types::I64, instr_pc as i64);
@@ -829,14 +887,9 @@ fn emit_store(
     let exc_block = builder.create_block();
     builder.ins().brif(is_exception, exc_block, &[], ok_block, &[]);
 
-    // Exception path: store all GPRs back to ctx
+    // Exception path: GPRs already flushed before the helper call — just return
     builder.switch_to_block(exc_block);
     builder.seal_block(exc_block);
-    let mem = MemFlags::trusted();
-    for i in 1..32usize {
-        builder.ins().store(mem, gpr[i], ctx_ptr,
-            ir::immediates::Offset32::new(JitContext::gpr_offset(i)));
-    }
     builder.ins().return_(&[]);
 
     builder.switch_to_block(ok_block);

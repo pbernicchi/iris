@@ -8,3 +8,4 @@ scsi1.raw
 scsi2.raw
 cdrom4.iso
 Cargo.lock
+*.log

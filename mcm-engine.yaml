@@ -1,0 +1,52 @@
+project_name: iris
+db_path: .claude/knowledge.db
+rules_path: rules/
+plugins: []
+nudges:
+  # Tuned for 1M context (Opus 4.6) — sessions can safely run 400+ turns.
+  # Compaction/handoff thresholds are relaxed; enforcement thresholds are tightened.
+  store_reminder_turns: 6        # was 4 — less aggressive, sessions are longer
+  checkpoint_turns: 30            # was 10 — 1M context, no rush to checkpoint
+  mandatory_stop_turns: 320        # was 20 — allows much longer sessions
+  hyper_focus_threshold: 8        # was 3 — slight increase for longer sessions
+  rules_check_interval: 4         # was 5 — less frequent but still periodic
+  # Block tool calls (return error) after mandatory_stop + grace without checkpoint.
+  mandatory_stop_blocking: true
+  mandatory_stop_grace: 10        # was 5 — more grace for long sessions
+  # After N ignored nudges of the same type, escalate to blocking.
+  # TIGHTER than before — escalate faster when agent ignores nudges.
+  nudge_escalation_threshold: 2   # was 3
+
+server_name: iris-knowledge
+
+server_instructions: |
+
+  BEHAVIORAL MANDATES (non-negotiable):
+
+  0. Do not be lazy. Do not cheat. Focus on correctness and precision, not the "quickest way" to solve problems. Carefully examine any potential shortcut     and consider how it will impact downstream packages.
+
+  1. MUST call `report_error` BEFORE attempting manual fixes for any build/link/runtime error.
+     It logs the error AND auto-searches rules, errors, and compat catalog in one call.
+
+  2. MUST call `check_compat` BEFORE writing compat function implementations.
+
+  3. MUST call `add_rule` IMMEDIATELY after confirming a fix works (build passes, test passes).
+     Do NOT defer add_rule calls to session end — context pressure causes them to be dropped.
+     Pattern: report_error when you hit it -> fix it -> build passes -> add_rule RIGHT THEN.
+
+  4. MUST delegate to a sub-agent after 2 failed fix attempts for the same error.
+     Long debug sessions destroy parent context.
+
+  5. DB is CACHE, files are AUTHORITATIVE. Rule files (rules/packages/*.yaml, rules/generic.yaml,
+     compat/catalog.yaml, rules/methods/*.md) are the source of truth. When using add_rule,
+     provide file_path pointing to the authoritative rule file.
+
+  Tool quick reference:
+  - `search` (or `knowledge_query`): Search rules, knowledge, errors, compat
+  - `report_error`: Log error + auto-search for fixes (THE KILLER FEATURE)
+  - `check_compat`: Search compat/catalog.yaml for a symbol
+  - `add_knowledge` (or `report_finding`): Store findings/decisions/insights
+  - `add_negative`: Store anti-patterns and dead ends
+  - `add_rule`: Create/index rule after fixing a problem
+  - `session_start`: Initialize session with context
+  - `session_handoff`: Snapshot state for next session

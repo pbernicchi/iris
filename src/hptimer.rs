@@ -366,12 +366,14 @@ fn timer_thread_loop(inner: Arc<Mutex<TimerManagerInner>>, new_timer_added: Arc<
 
                 let delay = target - sleep_now;
 
-                if delay > Duration::from_millis(2) {
+                if delay > Duration::from_micros(200) {
                     // Park with a safe threshold
-                    let park_duration = delay - Duration::from_millis(1);
+                    let park_duration = delay - Duration::from_micros(100);
                     thread::park_timeout(park_duration);
                 } else {
-                    std::hint::spin_loop();
+                    // Short sleep instead of spin — yields the core without
+                    // burning CPU while waiting for the timer to fire.
+                    thread::sleep(Duration::from_micros(50));
                 }
             }
         } else {

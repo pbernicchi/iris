@@ -8,7 +8,10 @@ pub mod cache;
 pub mod compiler;
 pub mod dispatch;
 pub mod helpers;
+pub mod profile;
+pub mod snapshot;
 
 pub use context::JitContext;
 pub use cache::{CodeCache, CompiledBlock};
+pub use snapshot::CpuRollbackSnapshot;
 pub use compiler::BlockCompiler;
