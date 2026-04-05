@@ -105,7 +105,7 @@ const MODE_MONO:   usize = 1;
 const MODE_STEREO: usize = 2;
 const MODE_QUAD:   usize = 3;
 
-// Pre-buffer: accumulate this many ms of audio samples before opening the cpal stream.
+// Pre-buffer: accumulate this many ms of audio samples before pushing to the ring.
 // This gives the CPU time to fill its circular DMA buffer before we start draining it,
 // preventing initial underrun.
 const PREBUF_MS: u64 = 20;
@@ -116,19 +116,25 @@ const RING_BUF_MULTIPLIER: usize = 16;
 // Consecutive dry reads before giving up prebuf and opening stream anyway.
 const DRY_LIMIT: u32 = 100;
 
-// ─── cpal stream wrapper ─────────────────────────────────────────────────────
+// Sample rates to try when opening the persistent output stream, in order.
+const PREFERRED_RATES: &[u32] = &[48000, 44100, 22050];
 
-// Per-codec audio output: owns the cpal Stream and the producer end of the ring buffer.
-struct CodecStream {
-    // sample_rate the codec is producing (what IRIX configured)
-    sample_rate: u32,
-    // actual sample rate the cpal stream was opened at (may differ from sample_rate)
+// ─── Audio output (owned by Codec A, opened once at start, closed at stop) ───
+
+// Opened once at `start()` at the best available host rate; the codec A timer
+// pushes i16 stereo pairs through a resampler into the ring buffer producer.
+// The stream plays silence when the ring is empty (cpal fills with 0).
+struct AudioOut {
     stream_rate: u32,
     producer: Producer<i16>,
-    resampler: Resampler,
-    // Keep stream alive; drop to tear down
+    // Keep stream alive; dropped when AudioOut is dropped at stop().
     _stream: cpal::Stream,
 }
+
+// cpal::Stream is !Send/!Sync on some platforms (ALSA uses raw pointers internally),
+// but it is safe to hold inside a Mutex.
+unsafe impl Send for AudioOut {}
+unsafe impl Sync for AudioOut {}
 
 // Simple skip/repeat resampler using a fixed-point accumulator.
 // Produces output at `out_rate` from input at `in_rate`.
@@ -170,31 +176,45 @@ impl Resampler {
     }
 }
 
-// cpal::Stream is !Send/!Sync on some platforms (e.g. ALSA uses *mut internally),
-// but it is safe to hold behind a Mutex.
-unsafe impl Send for CodecStream {}
-unsafe impl Sync for CodecStream {}
-
 // ─── Per-channel mutable state, lives inside a Mutex ─────────────────────────
 
 struct CodecAState {
+    // AudioOut is opened once at start() and lives until stop().
+    // None only before start() or after stop().
+    out: Option<AudioOut>,
+    // Resampler from codec rate → stream rate.  Built (or rebuilt) when
+    // codec rate first becomes known or changes.
+    resampler: Option<Resampler>,
+    // True while we're still filling the initial prebuffer before feeding the ring.
+    prebuffering: bool,
     prebuf: Vec<i16>,
     dry: u32,
     nonzero_seen: bool,
-    stream: Option<CodecStream>,
     timer_id: Option<TimerId>,
-    audio_failed: bool,
 }
 
 impl CodecAState {
     fn new() -> Self {
-        Self { prebuf: Vec::new(), dry: 0, nonzero_seen: false, stream: None, timer_id: None, audio_failed: false }
+        Self { out: None, resampler: None, prebuffering: true, prebuf: Vec::new(),
+               dry: 0, nonzero_seen: false, timer_id: None }
     }
     fn reset_audio(&mut self) {
+        // Keep `out` — stream stays open.  Just reset codec-side state.
+        self.resampler = None;
+        self.prebuffering = true;
         self.prebuf.clear();
         self.dry = 0;
         self.nonzero_seen = false;
-        self.stream = None;
+    }
+    /// Push interleaved i16 stereo pairs through the resampler into the ring buffer.
+    fn push_to_ring(&mut self, samples: &[i16]) {
+        if let Some(rs) = &mut self.resampler {
+            if let Some(o) = &mut self.out {
+                for chunk in samples.chunks_exact(2) {
+                    rs.push(chunk[0], chunk[1], &mut o.producer);
+                }
+            }
+        }
     }
 }
 
@@ -272,29 +292,18 @@ fn prebuf_samples(rate: u32) -> usize {
     (rate as usize * 2 * PREBUF_MS as usize) / 1000
 }
 
-/// Fallback sample rates to try if the desired rate is unavailable.
-const FALLBACK_RATES: &[u32] = &[48000, 44100, 22050];
-
-/// Try to open a stereo i16 cpal output stream, first at `desired` Hz,
-/// then at each FALLBACK_RATES entry.  Returns (stream, producer, actual_rate).
-fn open_output_stream(desired: u32) -> Option<(cpal::Stream, Producer<i16>, u32)> {
+/// Open a persistent stereo i16 cpal output stream, trying PREFERRED_RATES in order.
+/// The stream plays silence when the ring buffer is empty.
+fn open_persistent_output() -> Option<AudioOut> {
     let host = cpal::default_host();
     let device = host.default_output_device()?;
 
-    // Build candidate list: desired first, then fallbacks (deduped)
-    let mut candidates = vec![desired];
-    for &r in FALLBACK_RATES {
-        if r != desired { candidates.push(r); }
-    }
-
-    for rate in candidates {
+    for &rate in PREFERRED_RATES {
         let config = cpal::StreamConfig {
             channels: 2,
             sample_rate: cpal::SampleRate(rate),
             buffer_size: cpal::BufferSize::Default,
         };
-        // Ring buffer holds RING_BUF_MULTIPLIER × PREBUF_MS worth of stereo samples
-        // (sized for the stream rate so the consumer doesn't starve)
         let ring_size = prebuf_samples(rate) * RING_BUF_MULTIPLIER;
         let (producer, mut consumer) = RingBuffer::<i16>::new(ring_size);
         let err_fn = |err| { eprintln!("HAL2: cpal stream error: {:?}", err); };
@@ -305,20 +314,19 @@ fn open_output_stream(desired: u32) -> Option<(cpal::Stream, Producer<i16>, u32)
         };
         let stream = match device.build_output_stream(&config, data_fn, err_fn, None) {
             Ok(s) => s,
-            Err(_) => { continue; }
+            Err(_) => continue,
         };
         if stream.play().is_err() { continue; }
-        #[cfg(feature = "developer")]
-        if rate != desired {
-            println!("HAL2: audio output: {:?} via {:?} — {}Hz unavailable, using {}Hz",
-                device.name(), host.id(), desired, rate);
-        } else {
-            println!("HAL2: audio output: {:?} via {:?} at {}Hz", device.name(), host.id(), rate);
-        }
-        return Some((stream, producer, rate));
+        println!("HAL2: audio output: {:?} via {:?} at {}Hz",
+            device.name().unwrap_or_default(), host.id(), rate);
+        return Some(AudioOut {
+            stream_rate: rate,
+            producer,
+            _stream: stream,
+        });
     }
 
-    eprintln!("HAL2: failed to open output stream at any rate (tried {:?})", FALLBACK_RATES);
+    eprintln!("HAL2: failed to open audio output at any rate (tried {:?})", PREFERRED_RATES);
     None
 }
 
@@ -406,7 +414,18 @@ impl Hal2 {
         let id = tm.add_recurring(Instant::now() + period, period, (), move |_| {
             let mut st = ca_state.lock();
 
-            // Read one stereo frame from DMA.
+            // No audio output — nothing to do.
+            let stream_rate = match st.out.as_ref() {
+                Some(o) => o.stream_rate,
+                None => return TimerReturn::Continue,
+            };
+
+            // (Re)build resampler if codec rate changed.
+            if st.resampler.as_ref().map_or(true, |r| r.in_rate != rate) {
+                st.resampler = Some(Resampler::new(rate, stream_rate));
+                dlog_dev!(LogModule::Hal2, "HAL2: Codec A resampler {}Hz → {}Hz", rate, stream_rate);
+            }
+
             let frame = read_frame_from(&dma_client, mode);
 
             match frame {
@@ -416,66 +435,29 @@ impl Hal2 {
                         dlog_dev!(LogModule::Hal2, "HAL2: Codec A first non-zero: l={} r={}", l, r);
                         st.nonzero_seen = true;
                     }
-
-                    if st.stream.is_none() && !st.audio_failed {
-                        // Prebuf phase
+                    if st.prebuffering {
+                        // Accumulate before feeding the ring to prevent underrun.
                         st.prebuf.push(l);
                         st.prebuf.push(r);
                         if st.prebuf.len() >= prebuf_samples(rate) {
-                            if let Some((stream, mut prod, stream_rate)) = open_output_stream(rate) {
-                                let mut resampler = Resampler::new(rate, stream_rate);
-                                // Flush prebuf through resampler
-                                let samples: Vec<i16> = std::mem::take(&mut st.prebuf);
-                                for chunk in samples.chunks_exact(2) {
-                                    resampler.push(chunk[0], chunk[1], &mut prod);
-                                }
-                                dlog_dev!(LogModule::Hal2, "HAL2: Codec A stream opened at {}Hz (stream {}Hz, prebuf={})",
-                                    rate, stream_rate, samples.len() / 2);
-                                st.stream = Some(CodecStream {
-                                    sample_rate: rate, stream_rate,
-                                    producer: prod, resampler, _stream: stream,
-                                });
-                            } else {
-                                st.audio_failed = true;
-                                st.prebuf.clear();
-                            }
+                            let samples = std::mem::take(&mut st.prebuf);
+                            st.push_to_ring(&samples);
+                            dlog_dev!(LogModule::Hal2, "HAL2: Codec A prebuf flushed ({} frames)", samples.len() / 2);
+                            st.prebuffering = false;
                         }
-                    } else if st.stream.is_some() {
-                        // Active — push to ring buffer (via resampler if rates differ)
-                        if let Some(cs) = st.stream.as_mut() {
-                            // Rebuild stream if codec rate changed
-                            if cs.sample_rate != rate {
-                                st.stream = None;
-                                st.prebuf.clear();
-                                return TimerReturn::RescheduleRecurring(Duration::from_secs_f64(1.0 / rate as f64));
-                            }
-                            cs.resampler.push(l, r, &mut cs.producer);
-                        }
+                    } else {
+                        // Active: push directly.
+                        st.push_to_ring(&[l, r]);
                     }
                 }
                 None => {
                     st.dry += 1;
-                    if st.stream.is_none() && !st.audio_failed && st.dry >= DRY_LIMIT && !st.prebuf.is_empty() {
-                        // Open stream with whatever we buffered
-                        if let Some((stream, mut prod, stream_rate)) = open_output_stream(rate) {
-                            let mut resampler = Resampler::new(rate, stream_rate);
-                            let samples: Vec<i16> = std::mem::take(&mut st.prebuf);
-                            for chunk in samples.chunks_exact(2) {
-                                resampler.push(chunk[0], chunk[1], &mut prod);
-                            }
-                            dlog_dev!(LogModule::Hal2, "HAL2: Codec A stream opened (dry) at {}Hz (stream {}Hz)", rate, stream_rate);
-                            st.stream = Some(CodecStream {
-                                sample_rate: rate, stream_rate,
-                                producer: prod, resampler, _stream: stream,
-                            });
-                        } else {
-                            st.audio_failed = true;
-                            st.prebuf.clear();
-                        }
-                        st.dry = 0;
-                    } else if st.stream.is_some() && st.dry >= DRY_LIMIT {
-                        dlog_dev!(LogModule::Hal2, "HAL2: Codec A DMA dry, closing stream");
-                        st.stream = None;
+                    if st.prebuffering && !st.prebuf.is_empty() && st.dry >= DRY_LIMIT {
+                        // Flush whatever we buffered so far rather than waiting forever.
+                        let samples = std::mem::take(&mut st.prebuf);
+                        st.push_to_ring(&samples);
+                        dlog_dev!(LogModule::Hal2, "HAL2: Codec A prebuf flushed (dry) after {} dry reads", st.dry);
+                        st.prebuffering = false;
                         st.dry = 0;
                     }
                 }
@@ -492,7 +474,7 @@ impl Hal2 {
         if let Some(id) = id {
             if let Some(tm) = self.timer_manager.get() { tm.remove(id); }
         }
-        self.ca_state.lock().reset_audio();
+        self.ca_state.lock().reset_audio(); // keeps `out` (stream stays open)
     }
 
     // ── Codec B input (silence writer) timer ─────────────────────────────────
@@ -610,9 +592,10 @@ impl Hal2 {
     }
 
     // ── React to dma_enable changes ───────────────────────────────────────────
+    // dma_drive uses physical HPC3 channel bits (unrelated to device indices)
+    // so we gate arming only on dma_enable.
 
     fn apply_dma_enable(&self, old: u16, new: u16) {
-
         let changed = |bit: u16| (old & bit) != (new & bit);
         let enabled = |bit: u16| (new & bit) != 0;
 
@@ -752,7 +735,12 @@ impl Hal2 {
                         return;
                     }
                     IAR_PARAM_2 => state.dma_endian = state.idr[0],
-                    IAR_PARAM_3 => state.dma_drive  = state.idr[0],
+                    IAR_PARAM_3 => {
+                        if state.dma_drive != state.idr[0] {
+                            dlog_dev!(LogModule::Hal2, "HAL2: DMA drive 0x{:02x} -> 0x{:02x}", state.dma_drive, state.idr[0]);
+                        }
+                        state.dma_drive = state.idr[0];
+                    }
                     _ => {}
                 },
                 IAR_TYPE_DMA => {
@@ -818,9 +806,8 @@ impl Hal2 {
                         _ => false,
                     };
                     if changed {
-                        let dma_enable = state.dma_enable;
                         drop(state);
-                        self.reclock_active(idx, dma_enable);
+                        self.reclock_active(idx);
                         return;
                     }
                 }
@@ -830,15 +817,15 @@ impl Hal2 {
     }
 
     /// Re-arm any active channels that use BRES clock `bres_idx` (0-based).
-    fn reclock_active(&self, bres_idx: usize, dma_enable: u16) {
-        // Read current clock indices for each channel under lock, then re-arm outside lock.
-        let (ca_clk, cb_clk, at_clk, ar_clk) = {
+    fn reclock_active(&self, bres_idx: usize) {
+        // Read current clock indices and active mask under lock, then re-arm outside lock.
+        let (ca_clk, cb_clk, at_clk, ar_clk, dma_enable) = {
             let s = self.state.lock();
             let (_, ca_clk, _) = s.codeca_cfg();
             let (_, cb_clk, _) = s.codecb_cfg();
             let (_, at_clk, _) = s.aestx_cfg();
             let (_, ar_clk, _) = s.aesrx_cfg();
-            (ca_clk, cb_clk, at_clk, ar_clk)
+            (ca_clk, cb_clk, at_clk, ar_clk, s.dma_enable)
         };
 
         if (dma_enable & DMA_EN_CODECA) != 0 && ca_clk == bres_idx {
@@ -969,16 +956,22 @@ impl Device for Hal2 {
     fn step(&self, _cycles: u64) {}
 
     fn start(&self) {
+        // Open persistent audio output once.  Codec A timer will push into it.
+        let audio = open_persistent_output();
+        if audio.is_none() {
+            eprintln!("HAL2: no audio output available");
+        }
+        self.ca_state.lock().out = audio;
+
         // Re-arm any channels that were already enabled (e.g. after a snapshot restore)
-        let (dma_enable, _) = {
-            let s = self.state.lock();
-            (s.dma_enable, ())
-        };
+        let dma_enable = self.state.lock().dma_enable;
         self.apply_dma_enable(0, dma_enable);
     }
 
     fn stop(&self) {
         self.disarm_all();
+        // Drop the audio output stream.
+        self.ca_state.lock().out = None;
     }
 
     fn is_running(&self) -> bool {
@@ -1012,6 +1005,8 @@ impl Device for Hal2 {
                     (s.dma_enable & DMA_EN_AES_TX != 0) as u8,
                     (s.dma_enable & DMA_EN_AES_RX != 0) as u8,
                 ).unwrap();
+                // dma_drive uses physical HPC3 channel bits (bit N = PBUS channel N)
+                writeln!(writer, "DMA drive:  0x{:02x}  (physical HPC3 channel bitmask)", s.dma_drive).unwrap();
 
                 for i in 0..3 {
                     let master = if s.bres_clock_sel[i] == 0 { 48000u32 } else { 44100 };
@@ -1041,8 +1036,10 @@ impl Device for Hal2 {
                 drop(s);
 
                 let ca = self.ca_state.lock();
-                writeln!(writer, "Codec A stream: {}  timer: {}",
-                    ca.stream.as_ref().map_or("none".to_string(), |cs| format!("{}Hz", cs.sample_rate)),
+                writeln!(writer, "Codec A out: {}  prebuf: {}  prebuffering: {}  timer: {}",
+                    ca.out.as_ref().map_or("none".to_string(), |o| format!("{}Hz", o.stream_rate)),
+                    ca.prebuf.len() / 2,
+                    ca.prebuffering,
                     ca.timer_id.map_or("none".to_string(), |id| format!("{:#x}", id)),
                 ).unwrap();
                 drop(ca);
@@ -1061,5 +1058,57 @@ impl Device for Hal2 {
             _ => return Err("Usage: hal2 status".to_string()),
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rtrb::RingBuffer;
+
+    fn resample(in_rate: u32, out_rate: u32, n_frames: usize) -> usize {
+        let (mut prod, mut cons) = RingBuffer::<i16>::new(n_frames * 4 + 16);
+        let mut r = Resampler::new(in_rate, out_rate);
+        for i in 0..n_frames {
+            r.push(i as i16, i as i16, &mut prod);
+        }
+        drop(prod);
+        let mut count = 0;
+        while cons.pop().is_ok() { count += 1; }
+        count / 2  // stereo pairs → frames
+    }
+
+    #[test]
+    fn resampler_passthrough() {
+        // 1:1 — every input frame produces exactly one output frame
+        assert_eq!(resample(44100, 44100, 1000), 1000);
+    }
+
+    #[test]
+    fn resampler_downsample_2x() {
+        // 44100 → 22050: every 2 inputs → 1 output, so 1000 in → 500 out
+        let out = resample(44100, 22050, 1000);
+        assert_eq!(out, 500, "44100→22050: expected 500 frames, got {}", out);
+    }
+
+    #[test]
+    fn resampler_upsample_2x() {
+        // 22050 → 44100: every input → 2 outputs, so 1000 in → 2000 out
+        let out = resample(22050, 44100, 1000);
+        assert_eq!(out, 2000, "22050→44100: expected 2000 frames, got {}", out);
+    }
+
+    #[test]
+    fn resampler_upsample_44100_to_48000() {
+        // 44100 → 48000: ratio ~1.0884, so 44100 in → 48000 out (over one second of audio)
+        let out = resample(44100, 48000, 44100);
+        assert_eq!(out, 48000, "44100→48000: expected 48000 frames, got {}", out);
+    }
+
+    #[test]
+    fn resampler_downsample_48000_to_44100() {
+        // 48000 → 44100: ratio ~0.919, so 48000 in → 44100 out
+        let out = resample(48000, 44100, 48000);
+        assert_eq!(out, 44100, "48000→44100: expected 44100 frames, got {}", out);
     }
 }
