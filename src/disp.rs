@@ -867,14 +867,27 @@ impl Rex3Screen {
     }
 
     /// Render the status bar into `statusbar_rgba` (16 rows, separate from the main overlay).
-    pub fn render_status_bar(&mut self, bar: &mut StatusBar, cycles: u64, fasttick: u64, decoded_delta: u64, l1i_hits: u64, l1i_fetches: u64, uncached: u64, hb: u64, count_step: u64) {
-        bar.update(hb);
-        bar.render(&mut self.statusbar_rgba, self.width, 0, cycles, fasttick, decoded_delta, l1i_hits, l1i_fetches, uncached, count_step);
+    pub fn render_status_bar(&mut self, bar: &mut StatusBar, stats: &BarStats) {
+        bar.update(stats.hb);
+        bar.render(&mut self.statusbar_rgba, self.width, 0, stats);
     }
 }
 
 /// Height of the status bar in pixels (one VGA glyph row = 16px)
 pub const STATUS_BAR_HEIGHT: usize = 16;
+
+/// Snapshot of CPU counters and wall-clock time captured once per refresh loop iteration.
+pub struct BarStats {
+    pub now:            std::time::Instant,
+    pub cycles:         u64,
+    pub fasttick:       u64,
+    pub decoded_delta:  u64,
+    pub l1i_hits:       u64,
+    pub l1i_fetches:    u64,
+    pub uncached:       u64,
+    pub hb:             u64,
+    pub count_step:     u64,
+}
 
 /// Fade duration in frames (~quarter second at 60 Hz)
 const FADE_FRAMES: u8 = 15;
@@ -884,8 +897,8 @@ const BAR_BG:        u32 = 0xFF202020; // dark grey background
 const BAR_FG:        u32 = 0xFF00CC00; // green text
 const BAR_ACTIVE:    u32 = 0xFF00FFAA; // bright cyan-green when active
 const BAR_DIM:       u32 = 0xFF004400; // dim when inactive
-const LED_RED_ON:    u32 = 0xFFFF2020; // bright red LED on
-const LED_RED_OFF:   u32 = 0xFF300000; // dim red LED off
+const LED_RED_ON:    u32 = 0xFF2020FF; // bright red LED on
+const LED_RED_OFF:   u32 = 0xFF000030; // dim red LED off
 const LED_GREEN_ON:  u32 = 0xFF20FF20; // bright green LED on
 const LED_GREEN_OFF: u32 = 0xFF003000; // dim green LED off
 
@@ -947,31 +960,30 @@ impl StatusBar {
     }
 
     /// Render STATUS_BAR_HEIGHT rows of status bar into `rgba` starting at row `bar_y`.
-    pub fn render(&mut self, rgba: &mut Vec<u32>, width: usize, bar_y: usize, cycles: u64, fasttick: u64, decoded_delta: u64, l1i_hits: u64, l1i_fetches: u64, uncached: u64, count_step: u64) {
+    pub fn render(&mut self, rgba: &mut Vec<u32>, width: usize, bar_y: usize, stats: &BarStats) {
         // Update MIPS and fasthz estimates from deltas and wall-clock delta
-        let now = std::time::Instant::now();
-        let dt = now.duration_since(self.prev_time).as_secs_f64();
+        let dt = stats.now.duration_since(self.prev_time).as_secs_f64();
         if dt >= 0.1 {
-            let dc = cycles.wrapping_sub(self.prev_cycles);
-            let df = fasttick.wrapping_sub(self.prev_fasttick);
+            let dc = stats.cycles.wrapping_sub(self.prev_cycles);
+            let df = stats.fasttick.wrapping_sub(self.prev_fasttick);
             self.mips        = (dc as f64 / dt / 1_000_000.0 * 10.0).round() / 10.0;
             #[cfg(feature = "developer")] {
-                let total_fetches = l1i_fetches + uncached;
-                self.decode_pct   = if total_fetches > 0 { decoded_delta as f64 / total_fetches as f64 * 100.0 } else { 0.0 };
-                self.l1i_hit_pct  = if l1i_fetches > 0 { l1i_hits as f64 / l1i_fetches as f64 * 100.0 } else { 0.0 };
-                self.uncached_pct = if dc > 0 { uncached as f64 / dc as f64 * 100.0 } else { 0.0 };
+                let total_fetches = stats.l1i_fetches + stats.uncached;
+                self.decode_pct   = if total_fetches > 0 { stats.decoded_delta as f64 / total_fetches as f64 * 100.0 } else { 0.0 };
+                self.l1i_hit_pct  = if stats.l1i_fetches > 0 { stats.l1i_hits as f64 / stats.l1i_fetches as f64 * 100.0 } else { 0.0 };
+                self.uncached_pct = if dc > 0 { stats.uncached as f64 / dc as f64 * 100.0 } else { 0.0 };
             }
             self.fasthz      = (df as f64 / dt).round();
-            self.prev_cycles   = cycles;
-            self.prev_fasttick = fasttick;
-            self.prev_time = now;
+            self.prev_cycles   = stats.cycles;
+            self.prev_fasttick = stats.fasttick;
+            self.prev_time = stats.now;
         }
 
         let tx_color = if self.enet_tx_fade > 0 { BAR_ACTIVE } else { BAR_DIM };
         let rx_color = if self.enet_rx_fade > 0 { BAR_ACTIVE } else { BAR_DIM };
 
         #[cfg(feature = "developer")]
-        let line = format!(" {:5.1} MIPS D:{:3.0}% I$:{:3.0}% UC:{:3.0}% {:4.0}Hz cs:{:05x}  NET:", self.mips, self.decode_pct, self.l1i_hit_pct, self.uncached_pct, self.fasthz, count_step);
+        let line = format!(" {:5.1} MIPS D:{:3.0}% I$:{:3.0}% UC:{:3.0}% {:4.0}Hz cs:{:05x}  NET:", self.mips, self.decode_pct, self.l1i_hit_pct, self.uncached_pct, self.fasthz, stats.count_step);
         #[cfg(not(feature = "developer"))]
         let line = format!(" {:5.1} MIPS {:4.0}Hz  NET:", self.mips, self.fasthz);
 

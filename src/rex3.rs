@@ -3099,29 +3099,32 @@ impl Rex3 {
             let start = std::time::Instant::now();
 
             // Poll and clear activity bits; preserve persistent LED bits.
-            let hb           = self.heartbeat.fetch_and(Self::HB_PERSISTENT, Ordering::Relaxed);
-            let cycles       = self.cycles.load(Ordering::Relaxed);
-            let fasttick     = self.fasttick_count.load(Ordering::Relaxed);
-            #[cfg(feature = "developer")]
-            let decoded      = self.decoded_count.swap(0, Ordering::Relaxed);
-            #[cfg(not(feature = "developer"))]
-            let decoded      = 0u64;
-            #[cfg(feature = "developer")]
-            let l1i_hits     = self.l1i_hit_count.swap(0, Ordering::Relaxed);
-            #[cfg(not(feature = "developer"))]
-            let l1i_hits     = 0u64;
-            #[cfg(feature = "developer")]
-            let l1i_fetches  = self.l1i_fetch_count.swap(0, Ordering::Relaxed);
-            #[cfg(not(feature = "developer"))]
-            let l1i_fetches  = 0u64;
-            #[cfg(feature = "developer")]
-            let uncached     = self.uncached_fetch_count.swap(0, Ordering::Relaxed);
-            #[cfg(not(feature = "developer"))]
-            let uncached     = 0u64;
-            #[cfg(feature = "developer")]
-            let count_step   = self.count_step_atomic.lock().load(Ordering::Relaxed);
-            #[cfg(not(feature = "developer"))]
-            let count_step   = 0u64;
+            let bar_stats = crate::disp::BarStats {
+                now:          start,
+                hb:           self.heartbeat.fetch_and(Self::HB_PERSISTENT, Ordering::Relaxed),
+                cycles:       self.cycles.load(Ordering::Relaxed),
+                fasttick:     self.fasttick_count.load(Ordering::Relaxed),
+                #[cfg(feature = "developer")]
+                decoded_delta: self.decoded_count.swap(0, Ordering::Relaxed),
+                #[cfg(not(feature = "developer"))]
+                decoded_delta: 0,
+                #[cfg(feature = "developer")]
+                l1i_hits:     self.l1i_hit_count.swap(0, Ordering::Relaxed),
+                #[cfg(not(feature = "developer"))]
+                l1i_hits:     0,
+                #[cfg(feature = "developer")]
+                l1i_fetches:  self.l1i_fetch_count.swap(0, Ordering::Relaxed),
+                #[cfg(not(feature = "developer"))]
+                l1i_fetches:  0,
+                #[cfg(feature = "developer")]
+                uncached:     self.uncached_fetch_count.swap(0, Ordering::Relaxed),
+                #[cfg(not(feature = "developer"))]
+                uncached:     0,
+                #[cfg(feature = "developer")]
+                count_step:   self.count_step_atomic.lock().load(Ordering::Relaxed),
+                #[cfg(not(feature = "developer"))]
+                count_step:   0,
+            };
 
             // Get unsafe access to framebuffers and context
             let fb_rgb = unsafe { &*self.fb_rgb.get() };
@@ -3173,7 +3176,7 @@ impl Rex3 {
                     self.diag.fetch_and(!Self::DIAG_LOOP_GL_RENDER, Ordering::Relaxed);
                 }
                 // Build and render status bar as a separate texture at the bottom
-                screen.render_status_bar(&mut status_bar, cycles, fasttick, decoded, l1i_hits, l1i_fetches, uncached, hb, count_step);
+                screen.render_status_bar(&mut status_bar, &bar_stats);
                 if let Some(ref mut r) = *renderer {
                     self.diag.fetch_or(Self::DIAG_LOOP_GL_RENDER, Ordering::Relaxed);
                     r.render_statusbar(&screen.statusbar_rgba, width);
