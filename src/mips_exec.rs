@@ -589,50 +589,26 @@ pub struct MipsExecutor<T: Tlb, C: MipsCache> {
     cached_pending: u64,
 }
 
-// ---- translate_fn wrappers (one per privilege × addressing-mode combination) ---------------
+// ---- translate_fn slow-path wrappers (one per privilege × addressing-mode combination) ------
 // These are free functions so they can be stored as bare fn pointers in MipsExecutor.
-// Each is a thin shim that delegates to the fully monomorphised translate_32/64bit_impl.
-
-// ---- nano-TLB probe/fill helper -----------------------------------------------
-// Shared by all 6 translate_fn wrappers. The slot index is `at as usize` (0/1/2).
-// On hit returns the cached TranslateResult directly.
-// On miss calls `slow` (the full translate), then fills the slot on success.
-#[inline(always)]
-fn nanotlb_translate<T: Tlb, C: MipsCache>(
-    e: &mut MipsExecutor<T, C>,
-    va: u64,
-    at: AccessType,
-    slow: fn(&mut MipsExecutor<T, C>, u64, AccessType) -> TranslateResult,
-) -> TranslateResult {
-    let idx = at as usize; // Fetch=0, Read=1, Write=2
-    let slot = &e.core.nanotlb[idx];
-    if slot.matches(va) {
-        return TranslateResult::ok(slot.phys_addr(va), slot.cache_attr_raw());
-    }
-    let result = slow(e, va, at);
-    if !result.is_exception() {
-        e.core.nanotlb[idx].fill_raw(va, result.phys as u64, result.status & 0x7);
-    }
-    result
-}
-
+// They are only called on a nanotlb miss — the nanotlb probe happens before the fn-pointer call.
 fn translate_32_kernel<T: Tlb, C: MipsCache>(e: &mut MipsExecutor<T,C>, va: u64, at: AccessType) -> TranslateResult {
-    nanotlb_translate(e, va, at, |e, va, at| e.translate_32bit_impl::<false, {crate::mips_core::PRIV_KERNEL}>(va, at))
+    e.translate_32bit_impl::<false, {crate::mips_core::PRIV_KERNEL}>(va, at)
 }
 fn translate_32_supervisor<T: Tlb, C: MipsCache>(e: &mut MipsExecutor<T,C>, va: u64, at: AccessType) -> TranslateResult {
-    nanotlb_translate(e, va, at, |e, va, at| e.translate_32bit_impl::<false, {crate::mips_core::PRIV_SUPERVISOR}>(va, at))
+    e.translate_32bit_impl::<false, {crate::mips_core::PRIV_SUPERVISOR}>(va, at)
 }
 fn translate_32_user<T: Tlb, C: MipsCache>(e: &mut MipsExecutor<T,C>, va: u64, at: AccessType) -> TranslateResult {
-    nanotlb_translate(e, va, at, |e, va, at| e.translate_32bit_impl::<false, {crate::mips_core::PRIV_USER}>(va, at))
+    e.translate_32bit_impl::<false, {crate::mips_core::PRIV_USER}>(va, at)
 }
 fn translate_64_kernel<T: Tlb, C: MipsCache>(e: &mut MipsExecutor<T,C>, va: u64, at: AccessType) -> TranslateResult {
-    nanotlb_translate(e, va, at, |e, va, at| e.translate_64bit_impl::<false, {crate::mips_core::PRIV_KERNEL}>(va, at))
+    e.translate_64bit_impl::<false, {crate::mips_core::PRIV_KERNEL}>(va, at)
 }
 fn translate_64_supervisor<T: Tlb, C: MipsCache>(e: &mut MipsExecutor<T,C>, va: u64, at: AccessType) -> TranslateResult {
-    nanotlb_translate(e, va, at, |e, va, at| e.translate_64bit_impl::<false, {crate::mips_core::PRIV_SUPERVISOR}>(va, at))
+    e.translate_64bit_impl::<false, {crate::mips_core::PRIV_SUPERVISOR}>(va, at)
 }
 fn translate_64_user<T: Tlb, C: MipsCache>(e: &mut MipsExecutor<T,C>, va: u64, at: AccessType) -> TranslateResult {
-    nanotlb_translate(e, va, at, |e, va, at| e.translate_64bit_impl::<false, {crate::mips_core::PRIV_USER}>(va, at))
+    e.translate_64bit_impl::<false, {crate::mips_core::PRIV_USER}>(va, at)
 }
 
 /// Free-standing trampoline for the CP0 Status callback installed by `install_status_cb`.
@@ -802,6 +778,23 @@ For R4000SC/MC CPUs:
     pub fn install_status_cb(&mut self) {
         let ctx = self as *mut Self as *mut core::ffi::c_void;
         self.core.status_changed_cb = Some((mips_executor_status_cb::<T, C>, ctx));
+    }
+
+    /// Probe the nanotlb for `va` using slot AT (Fetch=0, Read=1, Write=2).
+    /// On hit: returns the cached result with no function-pointer call.
+    /// On miss: calls `translate_fn` (the slow path) and fills the slot on success.
+    #[inline(always)]
+    fn nanotlb_translate<const AT: u8>(&mut self, va: u64) -> TranslateResult {
+        let slot = &self.core.nanotlb[AT as usize];
+        if slot.matches(va) {
+            return TranslateResult::ok(slot.phys_addr(va), slot.cache_attr_raw());
+        }
+        let at = unsafe { std::mem::transmute::<u8, AccessType>(AT) };
+        let result = (self.translate_fn)(self, va, at);
+        if !result.is_exception() {
+            self.core.nanotlb[AT as usize].fill_raw(va, result.phys as u64, result.status & 0x7);
+        }
+        result
     }
 
     /// Re-derive `translate_fn` from the current CP0 Status register.
@@ -1487,7 +1480,7 @@ For R4000SC/MC CPUs:
         let translate_result = if DEBUG {
             self.translate_impl::<true>(virt_addr, AccessType::Fetch)
         } else {
-            (self.translate_fn)(self, virt_addr, AccessType::Fetch)
+            self.nanotlb_translate::<{AccessType::Fetch as u8}>(virt_addr)
         };
         if translate_result.is_exception() { return Err(translate_result.status); }
         let phys_addr = translate_result.phys;
@@ -1563,11 +1556,10 @@ For R4000SC/MC CPUs:
             return Err(exec_exception(EXC_ADEL));
         }
 
-        let access_type = if DEBUG { AccessType::Debug } else { AccessType::Read };
         let translate_result = if DEBUG {
-            self.translate_impl::<true>(virt_addr, access_type)
+            self.translate_impl::<true>(virt_addr, AccessType::Debug)
         } else {
-            (self.translate_fn)(self, virt_addr, access_type)
+            self.nanotlb_translate::<{AccessType::Read as u8}>(virt_addr)
         };
         if translate_result.is_exception() { return Err(translate_result.status); }
         {
@@ -1674,11 +1666,10 @@ For R4000SC/MC CPUs:
             return exec_exception(EXC_ADES);
         }
 
-        let access_type = if DEBUG { AccessType::Debug } else { AccessType::Write };
         let translate_result = if DEBUG {
-            self.translate_impl::<true>(virt_addr, access_type)
+            self.translate_impl::<true>(virt_addr, AccessType::Debug)
         } else {
-            (self.translate_fn)(self, virt_addr, access_type)
+            self.nanotlb_translate::<{AccessType::Write as u8}>(virt_addr)
         };
         if translate_result.is_exception() { return translate_result.status; }
         let phys_addr = translate_result.phys as u64;
@@ -1747,11 +1738,10 @@ For R4000SC/MC CPUs:
         }
 
         // virt_addr is already doubleword-aligned (callers guarantee this)
-        let access_type = if DEBUG { AccessType::Debug } else { AccessType::Write };
         let translate_result = if DEBUG {
-            self.translate_impl::<true>(virt_addr, access_type)
+            self.translate_impl::<true>(virt_addr, AccessType::Debug)
         } else {
-            (self.translate_fn)(self, virt_addr, access_type)
+            self.nanotlb_translate::<{AccessType::Write as u8}>(virt_addr)
         };
         if translate_result.is_exception() { return translate_result.status; }
         let phys_addr = translate_result.phys as u64;
@@ -2860,7 +2850,7 @@ For R4000SC/MC CPUs:
 
         let phys_addr = if needs_translation {
             // Hit operations need address translation
-            let tr = (self.translate_fn)(self, virt_addr, AccessType::Read);
+            let tr = self.nanotlb_translate::<{AccessType::Read as u8}>(virt_addr);
             if tr.is_exception() { return tr.status; }
             tr.phys as u64
         } else {
@@ -2901,7 +2891,7 @@ For R4000SC/MC CPUs:
                 self.core.write_gpr(rt_reg, value as i32 as i64 as u64);
                 // Store physical address in LLAddr register
                 // The LLAddr register stores bits 35..4 of the physical address
-                let tr = (self.translate_fn)(self, virt_addr, AccessType::Read);
+                let tr = self.nanotlb_translate::<{AccessType::Read as u8}>(virt_addr);
                 if !tr.is_exception() {
                     let lladdr = (tr.phys >> 4) as u32;
                     self.cache.set_lladdr(lladdr);
@@ -2928,7 +2918,7 @@ For R4000SC/MC CPUs:
         }
 
         // Check if address matches the LL address
-        let tr = (self.translate_fn)(self, virt_addr, AccessType::Write);
+        let tr = self.nanotlb_translate::<{AccessType::Write as u8}>(virt_addr);
         if tr.is_exception() {
             self.cache.set_llbit(false);
             return tr.status;
@@ -2960,7 +2950,7 @@ For R4000SC/MC CPUs:
             Ok(value) => {
                 self.core.write_gpr(rt_reg, value);
                 // Store physical address in LLAddr register
-                let tr = (self.translate_fn)(self, virt_addr, AccessType::Read);
+                let tr = self.nanotlb_translate::<{AccessType::Read as u8}>(virt_addr);
                 if !tr.is_exception() {
                     let lladdr = (tr.phys >> 4) as u32;
                     self.cache.set_lladdr(lladdr);
@@ -2987,7 +2977,7 @@ For R4000SC/MC CPUs:
         }
 
         // Check if address matches the LLD address
-        let tr = (self.translate_fn)(self, virt_addr, AccessType::Write);
+        let tr = self.nanotlb_translate::<{AccessType::Write as u8}>(virt_addr);
         if tr.is_exception() {
             self.cache.set_llbit(false);
             return tr.status;

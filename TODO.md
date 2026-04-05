@@ -39,7 +39,7 @@ watchhi/watchlo register support for debugging, translate variants that fire exc
 
 HALF BAKED vino - all, hook up uvc camera
 
-scsi - eject, load cd
+DONE scsi - eject, load cd
 
 DONE scsi - C9 command
 
@@ -49,7 +49,7 @@ DONE scsi - large requests fail
 
 ui - file selection for cd load
 
-bus - writemask on write64 and write32 for more efficient uncached store left/right?
+DONE bus - writemask on write64 and write32 for more efficient uncached store left/right?
 
 all - examine locks, possibly switch to spin, first check peripherials then lock in hpc and ioc
 
