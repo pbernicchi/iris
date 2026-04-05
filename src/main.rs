@@ -1,11 +1,9 @@
 use iris::config::{load_config, NfsConfig};
 use iris::machine::Machine;
-use iris::ui::Ui;
-use winit::event_loop::EventLoop;
 
 fn main() {
     let (cfg, scale) = load_config();
-    let event_loop = EventLoop::new().unwrap();
+    let headless = cfg.headless;
 
     // Start unfsd before the machine so NFS is ready when IRIX boots.
     let nfs_proc = cfg.nfs.as_ref().map(|nfs| start_unfsd(nfs));
@@ -24,8 +22,19 @@ fn main() {
         Machine::run_console_client();
     });
 
-    let ui = Ui::new(machine.get_ps2(), machine.get_rex3(), machine.get_timer_manager(), &event_loop, scale);
-    ui.run(event_loop);
+    if headless {
+        // Headless mode: no window, no graphics, no audio.
+        // Park the main thread and let the machine run until killed.
+        eprintln!("iris: running headless (no window)");
+        std::thread::park();
+    } else {
+        use iris::ui::Ui;
+        use winit::event_loop::EventLoop;
+        let event_loop = EventLoop::new().unwrap();
+        let rex3 = machine.get_rex3().expect("rex3 must be present in non-headless mode");
+        let ui = Ui::new(machine.get_ps2(), rex3, machine.get_timer_manager(), &event_loop, scale);
+        ui.run(event_loop);
+    }
 
     machine.stop();
 

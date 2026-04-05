@@ -98,6 +98,15 @@ pub struct MachineConfig {
     /// Port forwarding rules (host port → guest port).
     #[serde(default)]
     pub port_forward: Vec<PortForwardConfig>,
+
+    /// Run without graphics (no window, no REX3). Use no_audio to also disable HAL2.
+    /// Useful for headless/server/CI environments.
+    #[serde(default)]
+    pub headless: bool,
+
+    /// Disable audio emulation (no HAL2). Independent of headless/graphics.
+    #[serde(default)]
+    pub no_audio: bool,
 }
 
 fn default_prom() -> String {
@@ -134,9 +143,12 @@ impl Default for MachineConfig {
             scale: default_scale(),
             nfs: None,
             port_forward: vec![],
+            headless: false,
+            no_audio: false,
         }
     }
 }
+
 
 impl MachineConfig {
     /// Load from `iris.toml` if it exists, otherwise return defaults.
@@ -259,6 +271,14 @@ pub struct Cli {
     #[arg(long = "2x", default_value_t = false)]
     pub scale2x: bool,
 
+    /// Run headless: no window, no REX3 graphics (audio unaffected; use --noaudio to disable)
+    #[arg(long, default_value_t = false)]
+    pub headless: bool,
+
+    /// Disable audio emulation (no HAL2); graphics still works
+    #[arg(long = "noaudio", default_value_t = false)]
+    pub no_audio: bool,
+
     /// Enable NFS share: path to the directory to export (enables NFS)
     #[arg(long = "nfs-dir", value_name = "DIR")]
     pub nfs_dir: Option<String>,
@@ -309,6 +329,8 @@ impl Cli {
         if let Some(p) = self.scsi7.clone()  { apply_scsi(&mut cfg.scsi, 7, p, false, vec![]); }
 
         if self.scale2x { cfg.scale = 2; }
+        if self.headless  { cfg.headless  = true; }
+        if self.no_audio  { cfg.no_audio  = true; }
 
         // NFS: --nfs-dir enables NFS; other flags refine an existing [nfs] section or the defaults.
         if let Some(dir) = &self.nfs_dir {

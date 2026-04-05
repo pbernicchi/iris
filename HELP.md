@@ -272,6 +272,17 @@ prom = "prom.bin"
 # Typical Indy has two banks; banks 2 and 3 are 0.
 banks = [128, 128, 0, 0]
 
+# Window scale factor: 1 = native (1024×768), 2 = 2× for HiDPI/4K.
+scale = 1
+
+# Headless mode: no window, no REX3 graphics.
+# Audio is unaffected — use no_audio to also disable HAL2.
+headless = false
+
+# Disable audio emulation (no HAL2 / no cpal).
+# Independent of headless; can be combined freely.
+no_audio = false
+
 # SCSI devices.  Valid IDs: 1–7.
 # For a hard disk, set cdrom = false.
 [scsi.1]
@@ -334,6 +345,11 @@ Options:
   --cdrom5-extra <ISO>     Additional disc for ID 5 changer (repeatable)
   --cdrom6-extra <ISO>     Additional disc for ID 6 changer (repeatable)
 
+  --2x                     2× window scaling for HiDPI/4K monitors
+
+  --headless               No window, no REX3 graphics (audio unaffected)
+  --noaudio                Disable HAL2 audio emulation (graphics unaffected)
+
   --nfs-dir <DIR>          Enable NFS share: directory to export
   --unfsd <PATH>           Path to unfsd binary [default: unfsd]
   --nfs-port <PORT>        Host port for NFS [default: 12049]
@@ -356,6 +372,15 @@ iris --cdrom4 irix65.iso --cdrom4-extra extras.iso --cdrom4-extra patches.iso
 
 # Point to a config file in another directory
 iris --config /opt/iris/my_machine.toml
+
+# Headless — no window, suitable for Docker/CI (audio still active)
+iris --headless
+
+# Headless with audio also disabled (lightest possible server mode)
+iris --headless --noaudio
+
+# Graphical but no audio (e.g. audio device unavailable on the host)
+iris --noaudio
 ```
 
 ---

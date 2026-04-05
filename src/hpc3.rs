@@ -86,6 +86,15 @@ pub const SEEQ_BASE: u32 = 0x54000;
 // PBUS PIO
 pub const PBUS_PIO_BASE: u32 = 0x58000;
 pub const HAL2_BASE: u32 = 0x58000;
+
+/// Returns the value a disabled (absent) HAL2 presents on reads.
+/// REV (offset 0x20) returns 0xFFFF — not a valid chip version, so the IRIX
+/// hal2 driver recognises "no chip" and skips init rather than spinning.
+/// All other registers return 0: ISR.TSTATUS=0 (not busy), no spurious state.
+fn hal2_absent_read(offset: u32) -> u16 {
+    use crate::hal2::HAL2_REV;
+    if (offset & 0xF0) == HAL2_REV { 0xFFFF } else { 0x0000 }
+}
 pub const HPC3_IOC_BASE: u32 = 0x59800;
 pub const PBUS_PIO_STRIDE: u32 = 0x400;
 
@@ -950,17 +959,17 @@ pub struct Hpc3 {
     pdma_channels: Vec<Arc<Mutex<PdmaChannel>>>,
     pdma_ops: Vec<Arc<dyn PdmaChannelOps>>,
     scsi_dev: Arc<Wd33c93a>,
-    hal2: Arc<Hal2>,
+    hal2: Option<Arc<Hal2>>,
     pdma_dump: Arc<AtomicU32>,
     guinness: bool,
 }
 
 impl Hpc3 {
     pub fn new(eeprom: Arc<Mutex<Eeprom93c56>>, ioc: Ioc, guinness: bool, heartbeat: Arc<AtomicU64>) -> Self {
-        Self::with_nfs(eeprom, ioc, guinness, heartbeat, None, vec![])
+        Self::with_nfs(eeprom, ioc, guinness, heartbeat, None, vec![], false)
     }
 
-    pub fn with_nfs(eeprom: Arc<Mutex<Eeprom93c56>>, ioc: Ioc, guinness: bool, heartbeat: Arc<AtomicU64>, nfs: Option<NfsConfig>, port_forwards: Vec<crate::config::PortForwardConfig>) -> Self {
+    pub fn with_nfs(eeprom: Arc<Mutex<Eeprom93c56>>, ioc: Ioc, guinness: bool, heartbeat: Arc<AtomicU64>, nfs: Option<NfsConfig>, port_forwards: Vec<crate::config::PortForwardConfig>, headless: bool) -> Self {
         let rtc = Arc::new(Ds1x86::new(8192));
         let pdma_dump = Arc::new(AtomicU32::new(0));
         
@@ -1029,7 +1038,7 @@ impl Hpc3 {
 
         let scsi_dev = Arc::new(Wd33c93a::new(Some(scsi0_dma), Some(scsi0_irq), heartbeat.clone()));
         
-        let hal2 = Arc::new(Hal2::new(dma_clients[0..8].to_vec()));
+        let hal2 = if headless { None } else { Some(Arc::new(Hal2::new(dma_clients[0..8].to_vec()))) };
 
         Self {
             state,
@@ -1047,7 +1056,7 @@ impl Hpc3 {
     }
 
     pub fn set_timer_manager(&self, tm: Arc<TimerManager>) {
-        self.hal2.set_timer_manager(tm);
+        if let Some(hal2) = &self.hal2 { hal2.set_timer_manager(tm); }
     }
 
     pub fn set_phys(&self, mem: Arc<dyn BusDevice>) {
@@ -1077,8 +1086,8 @@ impl Hpc3 {
         &self.seeq
     }
 
-    pub fn hal2(&self) -> &Arc<Hal2> {
-        &self.hal2
+    pub fn hal2(&self) -> Option<&Arc<Hal2>> {
+        self.hal2.as_ref()
     }
 
     pub fn scsi(&self) -> &Arc<Wd33c93a> {
@@ -1098,7 +1107,7 @@ impl Hpc3 {
         // Delegate to child components
         self.seeq.register_locks();
         self.scsi_dev.register_locks();
-        self.hal2.register_locks();
+        if let Some(hal2) = &self.hal2 { hal2.register_locks(); }
         self.ioc.register_locks();
     }
 }
@@ -1113,11 +1122,11 @@ impl Device for Hpc3 {
         self.scsi_dev.stop();
         self.rtc.stop();
         self.ioc.stop();
-        self.hal2.stop();
+        if let Some(hal2) = &self.hal2 { hal2.stop(); }
     }
 
     fn start(&self) {
-        self.hal2.start();
+        if let Some(hal2) = &self.hal2 { hal2.start(); }
         self.ioc.start();
         self.rtc.start();
         self.scsi_dev.start();
@@ -1133,7 +1142,7 @@ impl Device for Hpc3 {
         cmds.extend(self.rtc.register_commands());
         cmds.extend(self.seeq.register_commands());
         cmds.extend(self.scsi_dev.register_commands());
-        cmds.extend(self.hal2.register_commands());
+        if let Some(hal2) = &self.hal2 { cmds.extend(hal2.register_commands()); }
         cmds
     }
 
@@ -1221,7 +1230,11 @@ impl Device for Hpc3 {
              return self.scsi_dev.execute_command(cmd, args, writer);
         }
         if cmd == "hal2" {
-             return self.hal2.execute_command(cmd, args, writer);
+            if let Some(hal2) = &self.hal2 {
+                return hal2.execute_command(cmd, args, writer);
+            }
+            let _ = writeln!(writer, "hal2: not available in headless mode");
+            return Ok(());
         }
         if cmd == "rtc" {
              return self.rtc.execute_command(cmd, args, writer);
@@ -1453,8 +1466,11 @@ impl BusDevice for Hpc3 {
 
         // Channel 0: HAL2 (0x58000 - 0x583FF)
         if (HAL2_BASE..HAL2_BASE + 0x400).contains(&offset) {
-            let r = self.hal2.read(offset - HAL2_BASE);
-            return if r.is_ok() { BusRead32::ok(r.data as u32) } else { BusRead32 { status: r.status, data: 0 } };
+            if let Some(hal2) = &self.hal2 {
+                let r = hal2.read(offset - HAL2_BASE);
+                return if r.is_ok() { BusRead32::ok(r.data as u32) } else { BusRead32 { status: r.status, data: 0 } };
+            }
+            return BusRead32::ok(hal2_absent_read(offset - HAL2_BASE) as u32);
         }
 
         // PBUS PIO (0x58000 - 0x5BFFF)
@@ -1594,7 +1610,10 @@ impl BusDevice for Hpc3 {
 
         // Channel 0: HAL2 (0x58000 - 0x583FF)
         if (HAL2_BASE..HAL2_BASE + 0x400).contains(&offset) {
-            return self.hal2.write(offset - HAL2_BASE, val as u16);
+            if let Some(hal2) = &self.hal2 {
+                return hal2.write(offset - HAL2_BASE, val as u16);
+            }
+            return BUS_OK;
         }
 
         // PBUS PIO (0x58000 - 0x5BFFF)
@@ -1631,7 +1650,10 @@ impl BusDevice for Hpc3 {
 
         // HAL2 registers are 16-bit; forward directly
         if (HAL2_BASE..HAL2_BASE + 0x400).contains(&offset) {
-            return self.hal2.read(offset - HAL2_BASE);
+            if let Some(hal2) = &self.hal2 {
+                return hal2.read(offset - HAL2_BASE);
+            }
+            return BusRead16::ok(hal2_absent_read(offset - HAL2_BASE));
         }
 
         BusRead16::ok(0)
@@ -1642,7 +1664,10 @@ impl BusDevice for Hpc3 {
 
         // HAL2 registers are 16-bit; forward directly
         if (HAL2_BASE..HAL2_BASE + 0x400).contains(&offset) {
-            return self.hal2.write(offset - HAL2_BASE, val);
+            if let Some(hal2) = &self.hal2 {
+                return hal2.write(offset - HAL2_BASE, val);
+            }
+            return BUS_OK;
         }
 
         BUS_OK

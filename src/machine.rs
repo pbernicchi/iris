@@ -83,7 +83,7 @@ impl Machine {
         let timer_manager = Arc::new(TimerManager::new());
         ioc.set_timer_manager(timer_manager.clone());
         ioc.set_heartbeat(heartbeat.clone());
-        let hpc3 = Hpc3::with_nfs(eeprom.clone(), ioc.clone(), true, heartbeat.clone(), cfg.nfs.clone(), cfg.port_forward.clone());
+        let hpc3 = Hpc3::with_nfs(eeprom.clone(), ioc.clone(), true, heartbeat.clone(), cfg.nfs.clone(), cfg.port_forward.clone(), cfg.no_audio);
         hpc3.set_timer_manager(timer_manager.clone());
 
         // Attach SCSI devices from config (IDs 1–7).
@@ -110,14 +110,18 @@ impl Machine {
             }
         }
 
-        // REX3 Graphics — receives the shared heartbeat and cycles Arcs directly
-        let rex3 = Arc::new(Rex3::new(heartbeat, cycles.clone(), fasttick_count.clone(), decoded_count.clone(), Arc::clone(&l1i_hit_count), Arc::clone(&l1i_fetch_count), Arc::clone(&uncached_fetch_count)));
-
-        // Connect VBlank interrupt to IOC
-        let ioc_clone = ioc.clone();
-        rex3.set_vblank_callback(Arc::new(move |active| {
-            ioc_clone.set_interrupt(crate::ioc::IocInterrupt::VerticalRetrace, active);
-        }));
+        // REX3 Graphics — skipped in headless mode
+        let rex3: Option<Arc<Rex3>> = if cfg.headless {
+            None
+        } else {
+            let r = Arc::new(Rex3::new(heartbeat, cycles.clone(), fasttick_count.clone(), decoded_count.clone(), Arc::clone(&l1i_hit_count), Arc::clone(&l1i_fetch_count), Arc::clone(&uncached_fetch_count)));
+            // Connect VBlank interrupt to IOC
+            let ioc_clone = ioc.clone();
+            r.set_vblank_callback(Arc::new(move |active| {
+                ioc_clone.set_interrupt(crate::ioc::IocInterrupt::VerticalRetrace, active);
+            }));
+            Some(r)
+        };
 
         // VINO (Video-In, No Out) — GIO64 at 0x1F080000
         let vino = crate::vino::Vino::new();
@@ -209,7 +213,7 @@ impl Machine {
 
         // Share count_step_atomic from MipsCore with Rex3 so the refresh thread can display it.
         #[cfg(feature = "developer")]
-        phys.rex3.set_count_step_atomic(Arc::clone(&executor.core.count_step_atomic));
+        if let Some(rex3) = &phys.rex3 { rex3.set_count_step_atomic(Arc::clone(&executor.core.count_step_atomic)); }
 
         let cpu = Arc::new(MipsCpu::new(executor));
         let interrupts = cpu.interrupts.clone();
@@ -229,7 +233,7 @@ impl Machine {
         monitor.register_device(Arc::new(mc.clone()));
         monitor.register_device(Arc::new(hpc3.clone()));
         monitor.register_device(phys.clone());
-        monitor.register_device(phys.rex3.clone());
+        if let Some(rex3) = &phys.rex3 { monitor.register_device(rex3.clone()); }
         monitor.register_device(Arc::new(phys.vino.clone()));
         let monitor = Arc::new(monitor);
 
@@ -240,7 +244,7 @@ impl Machine {
             register_lock_fn("mc::eeprom", move || ep.is_locked());
             mc.register_locks();
             hpc3.register_locks();
-            phys.rex3.register_locks();
+            if let Some(rex3) = &phys.rex3 { rex3.register_locks(); }
             cpu.register_locks();
         }
         {
@@ -271,7 +275,7 @@ impl Machine {
         // Start peripherals
         self.mc.start();
         self.hpc3.start();
-        self._phys.rex3.start();
+        if let Some(rex3) = &self._phys.rex3 { rex3.start(); }
 
         // Start monitor server on localhost:8888
         self.monitor.clone().start_server("127.0.0.1:8888".to_string());
@@ -331,7 +335,7 @@ impl Machine {
 
     pub fn stop(&mut self) {
         self.cpu.stop();
-        self._phys.rex3.stop();
+        if let Some(rex3) = &self._phys.rex3 { rex3.stop(); }
         self.hpc3.stop();
         self.mc.stop();
     }
@@ -383,7 +387,7 @@ impl Machine {
         self.hpc3.ioc().ps2()
     }
 
-    pub fn get_rex3(&self) -> Arc<crate::rex3::Rex3> {
+    pub fn get_rex3(&self) -> Option<Arc<crate::rex3::Rex3>> {
         self._phys.rex3.clone()
     }
 
@@ -395,7 +399,7 @@ impl Machine {
     fn restart_peripherals(&mut self) {
         self.mc.start();
         self.hpc3.start();
-        self._phys.rex3.start();
+        if let Some(rex3) = &self._phys.rex3 { rex3.start(); }
     }
 
     /// Helper to power-on reset all devices.
@@ -420,9 +424,9 @@ impl Machine {
         // Seeq/Ethernet: reset regs + signal NAT flush.
         self.hpc3.seeq().power_on();
         // HAL2: reset all audio registers and channel state (timers already stopped).
-        self.hpc3.hal2().power_on();
+        if let Some(hal2) = self.hpc3.hal2() { hal2.power_on(); }
         self.hpc3.power_on();
-        self._phys.rex3.power_on();
+        if let Some(rex3) = &self._phys.rex3 { rex3.power_on(); }
     }
 
     /// Stop all threads, power-on reset every device in-place, restart peripherals.
@@ -489,9 +493,11 @@ impl Machine {
         snap.write_toml("hpc3.toml", &hpc3_toml).map_err(|e| e.to_string())?;
 
         // REX3
-        let rex3_toml = self._phys.rex3.save_state();
-        snap.write_toml("rex3.toml", &rex3_toml).map_err(|e| e.to_string())?;
-        self._phys.rex3.save_framebuffers(&snap.dir).map_err(|e| e.to_string())?;
+        if let Some(rex3) = &self._phys.rex3 {
+            let rex3_toml = rex3.save_state();
+            snap.write_toml("rex3.toml", &rex3_toml).map_err(|e| e.to_string())?;
+            rex3.save_framebuffers(&snap.dir).map_err(|e| e.to_string())?;
+        }
 
         // Bulk memory (raw binary, big-endian word layout) — 4 × 128MB banks
         for i in 0..4 {
@@ -558,9 +564,11 @@ impl Machine {
         self.hpc3.load_state(&hpc3_toml)?;
 
         // REX3
-        let rex3_toml = snap.read_toml("rex3.toml").map_err(|e| e.to_string())?;
-        self._phys.rex3.load_state(&rex3_toml)?;
-        self._phys.rex3.load_framebuffers(&snap.dir).map_err(|e| e.to_string())?;
+        if let Some(rex3) = &self._phys.rex3 {
+            let rex3_toml = snap.read_toml("rex3.toml").map_err(|e| e.to_string())?;
+            rex3.load_state(&rex3_toml)?;
+            rex3.load_framebuffers(&snap.dir).map_err(|e| e.to_string())?;
+        }
 
         // Bulk memory — 4 × 128MB banks
         for i in 0..4 {

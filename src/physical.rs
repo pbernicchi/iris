@@ -191,7 +191,7 @@ pub struct Physical {
     // 4 × 128MB RAM banks (0,1 in lomem; 2,3 in himem). base_addr set by remap_banks().
     banks: [Memory; 4],
 
-    pub rex3: Arc<Rex3>,
+    pub rex3: Option<Arc<Rex3>>,
     pub vino: Vino,
     mc: MemoryController,
     hpc3: Hpc3,
@@ -243,7 +243,7 @@ impl Physical {
 impl Physical {
     pub fn new(
         banks: [Memory; 4],
-        rex3: Arc<Rex3>,
+        rex3: Option<Arc<Rex3>>,
         vino: Vino,
         mc: MemoryController,
         hpc3: Hpc3,
@@ -297,7 +297,7 @@ impl Physical {
     fn build_device_map(&mut self) {
         let cpu_err_ptr: *const dyn BusDevice = &self.cpu_bus_error;
         let gio_err_ptr: *const dyn BusDevice = &self.gio_bus_error;
-        let rex3_ptr: *const dyn BusDevice = &*self.rex3;
+        let rex3_ptr: Option<*const dyn BusDevice> = self.rex3.as_deref().map(|r| r as *const dyn BusDevice);
         let vino_ptr: *const dyn BusDevice = &self.vino;
         let hpc3_ptr: *const dyn BusDevice = &self.hpc3;
         let mc_ptr: *const dyn BusDevice = &self.mc;
@@ -336,10 +336,13 @@ impl Physical {
             self.device_map[i as usize] = black_hole_ptr;
         }
 
-        // Map Newport/REX3 (4MB GIO slot at 0x1F000000)
-        for i in (NEWPORT_BASE >> 16)..((NEWPORT_END - 1) >> 16) + 1 {
-            self.device_map[i as usize] = rex3_ptr;
+        // Map Newport/REX3 (4MB GIO slot at 0x1F000000) — only if graphics enabled
+        if let Some(rex3_ptr) = rex3_ptr {
+            for i in (NEWPORT_BASE >> 16)..((NEWPORT_END - 1) >> 16) + 1 {
+                self.device_map[i as usize] = rex3_ptr;
+            }
         }
+        // else: GIO timeout from layer 2 already covers the Newport slot
 
         // GIO expansion slots 0 and 1 — no device attached, GIO timeout already set
         // (left as gio_err_ptr from layer 2)
