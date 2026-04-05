@@ -38,6 +38,33 @@ cdrom  = false
 [nfs]
 shared_dir = "./shared"
 
+# Port forwarding rules — forward host ports into the guest (IRIX).
+# proto:      "tcp" or "udp"
+# host_port:  port to listen on on the host
+# guest_port: port inside the VM to forward to
+# bind:       "localhost" (loopback only, default) or "any" (all interfaces)
+#
+# Example: forward host TCP 2323 → IRIX telnet (23), localhost only:
+[[port_forward]]
+proto      = "tcp"
+host_port  = 2323
+guest_port = 23
+bind       = "localhost"
+#
+# Example: forward host UDP 5353 → IRIX port 5353, all interfaces:
+#[[port_forward]]
+#proto      = "udp"
+#host_port  = 5353
+#guest_port = 5353
+#bind       = "any"
+
+#[[port_forward]]
+#proto      = "udp"
+#host_port  = 7777
+#guest_port = 7
+#bind       = "localhost"
+
+
 # Internal CD-ROM.
 # For a single disc, set path only.
 # For a changer (cycled with "scsi eject 4" in the monitor), list all

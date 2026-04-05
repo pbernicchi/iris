@@ -957,10 +957,10 @@ pub struct Hpc3 {
 
 impl Hpc3 {
     pub fn new(eeprom: Arc<Mutex<Eeprom93c56>>, ioc: Ioc, guinness: bool, heartbeat: Arc<AtomicU64>) -> Self {
-        Self::with_nfs(eeprom, ioc, guinness, heartbeat, None)
+        Self::with_nfs(eeprom, ioc, guinness, heartbeat, None, vec![])
     }
 
-    pub fn with_nfs(eeprom: Arc<Mutex<Eeprom93c56>>, ioc: Ioc, guinness: bool, heartbeat: Arc<AtomicU64>, nfs: Option<NfsConfig>) -> Self {
+    pub fn with_nfs(eeprom: Arc<Mutex<Eeprom93c56>>, ioc: Ioc, guinness: bool, heartbeat: Arc<AtomicU64>, nfs: Option<NfsConfig>, port_forwards: Vec<crate::config::PortForwardConfig>) -> Self {
         let rtc = Arc::new(Ds1x86::new(8192));
         let pdma_dump = Arc::new(AtomicU32::new(0));
         
@@ -1017,7 +1017,7 @@ impl Hpc3 {
             hpc3_state: state.clone(),
             ioc:        ioc.clone(),
         });
-        let gateway_cfg = GatewayConfig { nfs, ..GatewayConfig::default() };
+        let gateway_cfg = GatewayConfig { nfs, port_forwards, ..GatewayConfig::default() };
         let seeq = Arc::new(Seeq8003::with_config(Some(seeq_irq), Some(enet_rx_dma), Some(enet_tx_dma), gateway_cfg, heartbeat.clone()));
         // Publish seeq to both the DMA ops (CTRL reads) and the irq (status checks in set_interrupt)
         let _ = enet_seeq_lock.set(seeq.clone());

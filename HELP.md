@@ -89,11 +89,70 @@ DHCP reply options provided:
 ### NAT
 
 All outbound TCP, UDP, and ICMP traffic from the guest is NATed through the
-host's network.  Inbound connections from outside the host are not supported.
+host's network.
 
 ICMP ping to `192.168.0.1` is answered locally by the emulator (no host
 network needed), so it always works.  DNS queries are forwarded to the host's
 upstream resolver.
+
+### Port forwarding
+
+You can forward host ports into the guest to reach IRIX services (telnet, ftp,
+custom daemons, etc.) from the host or from the network.
+
+Add one `[[port_forward]]` section per rule to `iris.toml`:
+
+```toml
+# Forward host TCP port 2323 → IRIX telnet (port 23), localhost only
+[[port_forward]]
+proto      = "tcp"
+host_port  = 2323
+guest_port = 23
+bind       = "localhost"
+
+# Forward host UDP port 2007 → IRIX echo (port 7), localhost only
+[[port_forward]]
+proto      = "udp"
+host_port  = 2007
+guest_port = 7
+bind       = "localhost"
+
+# Expose IRIX telnet on all interfaces (reachable from LAN)
+[[port_forward]]
+proto      = "tcp"
+host_port  = 2323
+guest_port = 23
+bind       = "any"
+```
+
+| Field | Values | Description |
+|-------|--------|-------------|
+| `proto` | `tcp`, `udp` | Protocol |
+| `host_port` | 1–65535 | Port to listen on on the host |
+| `guest_port` | 1–65535 | Port inside IRIX to forward to |
+| `bind` | `localhost` (default), `any` | `localhost` = loopback only; `any` = all interfaces |
+
+The emulator prints a line for each rule that binds successfully at startup:
+
+```
+iris: TCP port forward 127.0.0.1:2323 → guest:23
+```
+
+#### Testing
+
+```bash
+# TCP — telnet into IRIX
+telnet localhost 2323
+
+# UDP — send a datagram to the IRIX echo service (inetd must have echo enabled)
+echo "hello" | nc -u -w1 localhost 2007
+```
+
+To check `/etc/inetd.conf` on IRIX for enabled services:
+
+```sh
+grep -v '^#' /etc/inetd.conf | grep -E 'tcp|udp'
+```
 
 ---
 

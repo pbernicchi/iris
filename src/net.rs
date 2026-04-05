@@ -5,11 +5,11 @@
 // software NAT stack, and enqueues inbound frames back via rtrb::Producer<Vec<u8>>.
 
 use std::collections::{HashMap, VecDeque};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use crate::config::NfsConfig;
+use crate::config::{ForwardBind, ForwardProto, NfsConfig, PortForwardConfig};
 use crate::devlog::LogModule;
 use parking_lot::{Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -52,6 +52,8 @@ pub struct GatewayConfig {
     pub dns_upstream: SocketAddr,
     /// NFS configuration; if Some, portmap and NAT redirection for NFS/mountd are enabled.
     pub nfs: Option<NfsConfig>,
+    /// Port forwarding rules: host listens and forwards to the guest.
+    pub port_forwards: Vec<PortForwardConfig>,
 }
 
 impl Default for GatewayConfig {
@@ -63,6 +65,7 @@ impl Default for GatewayConfig {
             netmask:     Ipv4Addr::new(255, 255, 255, 0),
             dns_upstream: "8.8.8.8:53".parse().unwrap(),
             nfs: None,
+            port_forwards: vec![],
         }
     }
 }
@@ -436,6 +439,32 @@ pub struct NatSnapshot {
     pub icmp: Vec<NatIcmpInfo>,
 }
 
+// ── Port-forward listeners ────────────────────────────────────────────────────
+
+/// Active TCP listener for one inbound port-forward rule.
+struct TcpFwdListener {
+    listener:   TcpListener,
+    guest_port: u16,
+}
+
+/// Active UDP socket for one inbound port-forward rule.
+struct UdpFwdListener {
+    sock:        UdpSocket,
+    guest_port:  u16,
+    host_port:   u16,
+    /// Most recent sender — replies from IRIX are forwarded back here.
+    last_sender: Option<SocketAddr>,
+}
+
+/// A TCP forward connection that has been accepted from the host but whose
+/// SYN to the guest is still awaiting a SYN-ACK.
+/// key in tcp_fwd_pending: (guest_port, ephemeral_sport)  — same layout as tcp_nat key
+/// where "dst" = guest_ip:guest_port and "src" = gateway:ephemeral.
+struct TcpFwdPending {
+    stream:     TcpStream,  // the host-side accepted connection
+    client_isn: u32,        // ISN we put in the synthetic SYN to the guest
+}
+
 // ── NAT engine ────────────────────────────────────────────────────────────────
 pub struct NatEngine {
     config:  GatewayConfig,
@@ -453,6 +482,16 @@ pub struct NatEngine {
     // Replies generated while draining TX frames are deferred to the next loop iteration
     // so they don't race with the TX completion interrupt in IRIX's interrupt handler.
     deferred_rx: Vec<Vec<u8>>,
+    // Port-forward listeners (set up once at construction, never replaced).
+    tcp_fwd_listeners: Vec<TcpFwdListener>,
+    udp_fwd_listeners: Vec<UdpFwdListener>,
+    // TCP forward connections whose SYN to the guest has been sent but SYN-ACK not yet received.
+    // key: (u32::from(guest_ip), guest_port, ephemeral_sport)
+    tcp_fwd_pending: HashMap<(u32, u16, u16), TcpFwdPending>,
+    // Monotonically increasing counter for generating ephemeral ports for inbound forwards.
+    fwd_ephemeral_next: u16,
+    // Guest MAC learned from any outbound frame (ARP SHA or Ethernet src).
+    guest_mac: Option<[u8; 6]>,
 }
 
 impl NatEngine {
@@ -463,9 +502,58 @@ impl NatEngine {
                tx_wake: Arc<(Mutex<()>, Condvar)>,
                running: Arc<AtomicBool>,
                ctl:     Arc<NatControl>) -> Self {
+        let mut tcp_fwd_listeners = Vec::new();
+        let mut udp_fwd_listeners = Vec::new();
+
+        for rule in &config.port_forwards {
+            let bind_addr = match rule.bind {
+                ForwardBind::Localhost => Ipv4Addr::LOCALHOST,
+                ForwardBind::Any      => Ipv4Addr::UNSPECIFIED,
+            };
+            match rule.proto {
+                ForwardProto::Tcp => {
+                    let addr = SocketAddr::new(IpAddr::V4(bind_addr), rule.host_port);
+                    match TcpListener::bind(addr) {
+                        Ok(listener) => {
+                            let _ = listener.set_nonblocking(true);
+                            eprintln!("iris: TCP port forward {}:{} → guest:{}",
+                                      bind_addr, rule.host_port, rule.guest_port);
+                            tcp_fwd_listeners.push(TcpFwdListener {
+                                listener,
+                                guest_port: rule.guest_port,
+                            });
+                        }
+                        Err(e) => eprintln!("iris: TCP port forward {}:{} failed to bind: {}",
+                                            bind_addr, rule.host_port, e),
+                    }
+                }
+                ForwardProto::Udp => {
+                    let addr = SocketAddr::new(IpAddr::V4(bind_addr), rule.host_port);
+                    match UdpSocket::bind(addr) {
+                        Ok(sock) => {
+                            let _ = sock.set_nonblocking(true);
+                            eprintln!("iris: UDP port forward {}:{} → guest:{}",
+                                      bind_addr, rule.host_port, rule.guest_port);
+                            udp_fwd_listeners.push(UdpFwdListener {
+                                sock,
+                                guest_port:  rule.guest_port,
+                                host_port:   rule.host_port,
+                                last_sender: None,
+                            });
+                        }
+                        Err(e) => eprintln!("iris: UDP port forward {}:{} failed to bind: {}",
+                                            bind_addr, rule.host_port, e),
+                    }
+                }
+            }
+        }
+
         Self { config, tx_cons, rx_prod, rx_wake, tx_wake, running, ctl,
                udp_nat: HashMap::new(), tcp_nat: HashMap::new(), tcp_tw: HashMap::new(),
-               icmp_nat: HashMap::new(), icmp_unavailable: false, deferred_rx: Vec::new() }
+               icmp_nat: HashMap::new(), icmp_unavailable: false, deferred_rx: Vec::new(),
+               tcp_fwd_listeners, udp_fwd_listeners,
+               tcp_fwd_pending: HashMap::new(), fwd_ephemeral_next: 49152,
+               guest_mac: None }
     }
 
     pub fn run(&mut self) {
@@ -484,6 +572,7 @@ impl NatEngine {
                 self.tcp_tw.clear();
                 self.udp_nat.clear();  // drops all UdpSockets
                 self.icmp_nat.clear(); // drops all ICMP raw sockets
+                self.tcp_fwd_pending.clear();
             }
 
             // FIXME: investigate interrupt race between TX completion and RX delivery.
@@ -514,6 +603,8 @@ impl NatEngine {
             self.poll_udp();
             self.poll_tcp();
             self.poll_icmp();
+            self.poll_tcp_fwd_listeners();
+            self.poll_udp_fwd_listeners();
             self.update_snapshot();
         }
     }
@@ -561,6 +652,10 @@ impl NatEngine {
     fn process(&mut self, frame: &[u8]) {
         if frame.len() < 14 { return; }
         let src_mac: [u8; 6] = frame[6..12].try_into().unwrap();
+        // Learn guest MAC from any outbound frame.
+        if self.guest_mac.is_none() {
+            self.guest_mac = Some(src_mac);
+        }
         let etype = r16(frame, 12);
         dlog_dev!(LogModule::Net, "NAT TX {}", eth_summary(frame));
         if self.ctl.dbg_tcp() && etype == ETHERTYPE_IP {
@@ -790,6 +885,21 @@ impl NatEngine {
         let dport = r16(udp, 2);
         let payload = &udp[8..];
         dlog_dev!(LogModule::Net, "NAT UDP {}:{} → {}:{}", src_ip, sport, dst_ip, dport);
+
+        // Intercept replies from guest back to a UDP port-forward listener.
+        // IRIX sends to gateway_ip:host_port; we forward to the original external sender.
+        if dst_ip == self.config.gateway_ip {
+            if let Some(idx) = self.udp_fwd_listeners.iter()
+                .position(|f| f.host_port == dport && f.guest_port == sport)
+            {
+                if let Some(sender) = self.udp_fwd_listeners[idx].last_sender {
+                    dlog_dev!(LogModule::Net, "NAT FWD UDP reply guest:{} → host:{} → {}", sport, dport, sender);
+                    let _ = self.udp_fwd_listeners[idx].sock.send_to(payload, sender);
+                }
+                return;
+            }
+        }
+
         match dport {
             UDP_PORT_BOOTP_SERVER => self.handle_bootp(src_mac, sport, payload),
             UDP_PORT_DNS          => self.forward_dns(src_mac, src_ip, sport, payload),
@@ -1047,6 +1157,52 @@ impl NatEngine {
         let fin      = flags & 0x01 != 0;
         let rst      = flags & 0x04 != 0;
 
+        // Intercept SYN-ACK from guest completing a port-forward TCP handshake.
+        // The guest sends: src=guest_ip:guest_port → dst=gateway_ip:ephemeral_sport
+        // We match by (guest_ip, guest_port, ephemeral_sport) in tcp_fwd_pending.
+        if syn && ack && dst_ip == self.config.gateway_ip {
+            let fwd_key = (u32::from(src_ip), sport, dport);
+            if let Some(pending) = self.tcp_fwd_pending.remove(&fwd_key) {
+                dlog_dev!(LogModule::Net, "NAT FWD TCP SYN-ACK from guest {}:{} ephemeral={}", src_ip, sport, dport);
+                // Send ACK to guest to complete 3-way handshake.
+                let ack_seq = seq.wrapping_add(1);
+                let seg = tcp_segment(self.config.gateway_ip, src_ip, dport, sport,
+                                      pending.client_isn.wrapping_add(1), ack_seq, 0x10, &[]);
+                let frame = ip_frame(client_mac, &self.config.gateway_mac,
+                                     self.config.gateway_ip, src_ip, IP_PROTO_TCP, &seg);
+                self.enqueue_rx(frame);
+                // Add to tcp_nat: stream is the accepted host connection; guest is the "client".
+                // Key: (dst_ip_u32=guest_ip, dport=guest_port, sport=ephemeral)
+                // But tcp_nat key is (dst_ip, dst_port, src_port) — for outbound it's
+                // (remote_ip, remote_port, local_client_port).
+                // For forwards: "remote" = gateway_ip (visible to guest as originator),
+                // "client" = guest. We'll use (gateway_ip, ephemeral, guest_port) as key
+                // so that when guest sends data to gateway:ephemeral, we can look it up.
+                let nat_key = (u32::from(self.config.gateway_ip), dport, sport);
+                let _ = pending.stream.set_nonblocking(true);
+                // server_seq/server_seq_acked track the sequence numbers WE send to IRIX.
+                // Our SYN consumed client_isn, so our first data byte is client_isn+1.
+                // ack_seq (= guest ISN+1) is what IRIX expects us to ACK — that goes into client_seq.
+                let our_send_seq = pending.client_isn.wrapping_add(1);
+                self.tcp_nat.insert(nat_key, NatTcpEntry {
+                    stream:           pending.stream,
+                    client_mac:       *client_mac,
+                    client_ip:        src_ip,
+                    client_port:      sport,
+                    server_ip:        self.config.gateway_ip,
+                    server_seq:       our_send_seq,
+                    server_seq_acked: our_send_seq,
+                    client_win:       r16(tcp, 14) as u32,
+                    client_seq:       ack_seq,
+                    last_use:         Instant::now(),
+                    fin_wait:         false,
+                    server_fin:       false,
+                    retransmit:       VecDeque::new(),
+                });
+                return;
+            }
+        }
+
         // Intercept portmap TCP (port 111) — handle inline, never hits the NAT table.
         if dport == UDP_PORT_PORTMAP && self.config.nfs.is_some() {
             if syn && !ack {
@@ -1293,6 +1449,108 @@ impl NatEngine {
         for k in fin_sent {
             self.tcp_nat.remove(&k);
             self.tcp_tw.insert(k, Instant::now());
+        }
+    }
+
+    // ── Inbound port-forward: TCP listener poll ───────────────────────────────
+    //
+    // For each TCP forward rule, accept() any pending connections (non-blocking).
+    // On accept: allocate an ephemeral port, inject a synthetic SYN frame into the
+    // guest's ethernet as if gateway_ip:ephemeral opened a connection to the guest.
+    // The accepted TcpStream is stored in tcp_fwd_pending until the guest replies
+    // with SYN-ACK (handled in handle_tcp above).
+    fn poll_tcp_fwd_listeners(&mut self) {
+        // Collect accepted streams to avoid mut borrow conflict while iterating listeners.
+        let mut accepted: Vec<(TcpStream, u16)> = Vec::new();
+        for fwd in &self.tcp_fwd_listeners {
+            loop {
+                match fwd.listener.accept() {
+                    Ok((stream, peer)) => {
+                        dlog_dev!(LogModule::Net, "NAT FWD TCP accepted {} → guest:{}", peer, fwd.guest_port);
+                        accepted.push((stream, fwd.guest_port));
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(e) => { dlog_dev!(LogModule::Net, "NAT FWD TCP accept error: {}", e); break; }
+                }
+            }
+        }
+        for (stream, guest_port) in accepted {
+            let ephemeral = self.fwd_ephemeral_next;
+            self.fwd_ephemeral_next = self.fwd_ephemeral_next.wrapping_add(1);
+            if self.fwd_ephemeral_next < 49152 { self.fwd_ephemeral_next = 49152; }
+
+            let client_isn = 0x6000_0000u32.wrapping_add(ephemeral as u32);
+            let guest_ip   = self.config.client_ip;
+            let gw_ip      = self.config.gateway_ip;
+            let gw_mac     = self.config.gateway_mac;
+
+            // Use the guest's real MAC if we've learned it; the SYN must be unicast or
+            // IRIX will drop it (broadcast dst MAC with unicast dst IP is rejected).
+            let Some(guest_mac) = self.guest_mac else {
+                dlog_dev!(LogModule::Net, "NAT FWD TCP: guest MAC not yet known, deferring SYN for guest:{}", guest_port);
+                // Put the stream back — we'll retry next poll cycle once we've seen a frame.
+                // Simplest approach: re-queue by pushing back into accepted list isn't possible
+                // here, so just drop this accept and let the host retry.
+                // In practice the guest MAC is always known by the time port-forward traffic arrives.
+                drop(stream);
+                continue;
+            };
+
+            dlog_dev!(LogModule::Net, "NAT FWD TCP inject SYN {}:{} → {}:{}", gw_ip, ephemeral, guest_ip, guest_port);
+            let seg = tcp_segment(gw_ip, guest_ip, ephemeral, guest_port,
+                                  client_isn, 0, 0x02, &[]);
+            let frame = ip_frame(&guest_mac, &gw_mac, gw_ip, guest_ip, IP_PROTO_TCP, &seg);
+            self.enqueue_rx(frame);
+
+            let fwd_key = (u32::from(guest_ip), guest_port, ephemeral);
+            self.tcp_fwd_pending.insert(fwd_key, TcpFwdPending { stream, client_isn });
+        }
+
+        // Stale pending entries (guest never answered the SYN) are flushed on machine reset.
+        // No per-entry expiry here since we don't track a timestamp; the guest will RST
+        // or the host side will close if the connection is abandoned.
+    }
+
+    // ── Inbound port-forward: UDP listener poll ───────────────────────────────
+    //
+    // For each UDP forward rule, drain all pending datagrams (non-blocking).
+    // Each datagram is injected into the guest as a UDP frame from gateway_ip:host_port
+    // to guest_ip:guest_port, so the guest can reply to gateway_ip:host_port.
+    // Replies from the guest go through the normal UDP NAT path (nat_udp) and are
+    // forwarded back to the host-side sender via the UDP forward socket.
+    fn poll_udp_fwd_listeners(&mut self) {
+        let mut received: Vec<(Vec<u8>, SocketAddr, u16, u16)> = Vec::new();
+        for fwd in &self.udp_fwd_listeners {
+            let mut buf = [0u8; 1500];
+            loop {
+                match fwd.sock.recv_from(&mut buf) {
+                    Ok((n, from)) => {
+                        dlog_dev!(LogModule::Net, "NAT FWD UDP {} → guest:{} len={}", from, fwd.guest_port, n);
+                        received.push((buf[..n].to_vec(), from, fwd.guest_port, fwd.host_port));
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(e) => { dlog_dev!(LogModule::Net, "NAT FWD UDP recv error: {}", e); break; }
+                }
+            }
+        }
+        for (data, from, guest_port, host_port) in received {
+            let Some(guest_mac) = self.guest_mac else {
+                dlog_dev!(LogModule::Net, "NAT FWD UDP: guest MAC not yet known, dropping datagram for guest:{}", guest_port);
+                continue;
+            };
+            // Record sender so we can forward IRIX's reply back to them.
+            if let Some(fwd) = self.udp_fwd_listeners.iter_mut()
+                .find(|f| f.host_port == host_port && f.guest_port == guest_port)
+            {
+                fwd.last_sender = Some(from);
+            }
+            let guest_ip = self.config.client_ip;
+            let gw_ip    = self.config.gateway_ip;
+            let gw_mac   = self.config.gateway_mac;
+            // Inject as UDP: src=gateway_ip:host_port dst=guest_ip:guest_port
+            let udp = udp_packet(gw_ip, guest_ip, host_port, guest_port, &data);
+            let frame = ip_frame(&guest_mac, &gw_mac, gw_ip, guest_ip, IP_PROTO_UDP, &udp);
+            self.enqueue_rx(frame);
         }
     }
 }

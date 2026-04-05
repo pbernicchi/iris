@@ -16,6 +16,42 @@ pub struct ScsiDeviceConfig {
     pub cdrom: bool,
 }
 
+/// Protocol for port forwarding.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum ForwardProto {
+    Tcp,
+    Udp,
+}
+
+/// Bind scope for a port forward listener.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum ForwardBind {
+    /// Listen only on 127.0.0.1 (loopback only).
+    Localhost,
+    /// Listen on 0.0.0.0 (all interfaces).
+    Any,
+}
+
+impl Default for ForwardBind {
+    fn default() -> Self { ForwardBind::Localhost }
+}
+
+/// One port-forward rule: host_port → guest_port on a given protocol.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PortForwardConfig {
+    /// Protocol: "tcp" or "udp".
+    pub proto: ForwardProto,
+    /// Host-side port to listen on.
+    pub host_port: u16,
+    /// Guest-side port to forward to (inside the VM).
+    pub guest_port: u16,
+    /// Bind scope: "localhost" (loopback only) or "any" (all interfaces).
+    #[serde(default)]
+    pub bind: ForwardBind,
+}
+
 /// NFS share configuration (requires unfsd on the host).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NfsConfig {
@@ -58,6 +94,10 @@ pub struct MachineConfig {
     /// NFS share configuration. If present, unfsd is started and NFS is available inside the VM.
     #[serde(default)]
     pub nfs: Option<NfsConfig>,
+
+    /// Port forwarding rules (host port → guest port).
+    #[serde(default)]
+    pub port_forward: Vec<PortForwardConfig>,
 }
 
 fn default_prom() -> String {
@@ -93,6 +133,7 @@ impl Default for MachineConfig {
             scsi: default_scsi(),
             scale: default_scale(),
             nfs: None,
+            port_forward: vec![],
         }
     }
 }
