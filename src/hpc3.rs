@@ -1066,8 +1066,8 @@ impl Hpc3 {
         self.seeq.set_phys(mem);
     }
 
-    pub fn add_scsi_device(&self, id: usize, path: &str, is_cdrom: bool, discs: Vec<String>) -> std::io::Result<()> {
-        self.scsi_dev.add_device(id, path, is_cdrom, discs)
+    pub fn add_scsi_device(&self, id: usize, path: &str, is_cdrom: bool, discs: Vec<String>, overlay: bool) -> std::io::Result<()> {
+        self.scsi_dev.add_device(id, path, is_cdrom, discs, overlay)
     }
 
     pub fn ioc(&self) -> &Ioc {
