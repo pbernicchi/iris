@@ -522,6 +522,7 @@ impl Ui {
                             mouse_delta.lock().accum = (0.0, 0.0);
                         }
                     }
+                    #[cfg(feature = "mouseabs")]
                     WindowEvent::CursorMoved { position, .. } => {
                         if mouse_grabbed {
                             let size = window.inner_size();
@@ -556,6 +557,16 @@ impl Ui {
                         // Rendering is handled by Rex3 refresh thread
                     }
                     _ => (),
+                },
+                // When CursorGrabMode::Locked is active, winit sends raw mouse
+                // motion as DeviceEvent instead of CursorMoved. This is the
+                // primary motion source on Wayland and for trackpads on X11.
+                Event::DeviceEvent { event: winit::event::DeviceEvent::MouseMotion { delta }, .. } => {
+                    if mouse_grabbed {
+                        let mut md = mouse_delta.lock();
+                        md.accum.0 += delta.0 / scale as f64;
+                        md.accum.1 += delta.1 / scale as f64;
+                    }
                 },
                 _ => (),
             }
