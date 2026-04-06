@@ -87,6 +87,16 @@ pub struct MipsCore {
     /// Key = `(delta >> 16) / 100 * 100`, value = number of occurrences.
     #[cfg(feature = "developer_ip7")]
     pub compare_delta_stats: std::collections::HashMap<u32, u32>,
+    /// Learned slow-tick CP0 delta in hardware counts (16.16 fixed-point, >> 16 = integer counts).
+    /// Initialised to 0 (unknown). First delta seen is assumed to be the 100 Hz (slow) tick.
+    compare_delta_slow: u64,
+    /// Learned fast-tick CP0 delta in hardware counts.
+    /// Initialised to 0 (unknown). Set once we see a delta ~10x smaller than delta_slow.
+    compare_delta_fast: u64,
+    /// The raw 16.16 fixed-point delta programmed in the *previous* Compare write.
+    /// Used for calibration: dt_ns/dc measure the old interval, so count_step must be
+    /// computed against the old delta, not the new one.  Zero = no previous write yet.
+    compare_delta_prev: u64,
     pub cp0_status: u32,      // 12: Status Register
     pub cp0_cause: u32,       // 13: Cause Register
     pub cp0_epc: u64,         // 14: Exception Program Counter
@@ -232,6 +242,9 @@ impl MipsCore {
             compare_last_instant: std::time::Instant::now(),
             #[cfg(feature = "developer_ip7")]
             compare_delta_stats: std::collections::HashMap::new(),
+            compare_delta_slow: 0,
+            compare_delta_fast: 0,
+            compare_delta_prev: 0,
             cp0_status: 0,
             cp0_cause: 0,
             cp0_epc: 0,
@@ -442,6 +455,54 @@ impl MipsCore {
         }
     }
 
+    /// Bin a CP0 Compare delta into a target tick period in nanoseconds
+    /// (1_000_000 for 1 kHz, 10_000_000 for 100 Hz).
+    ///
+    /// `delta` may be in any consistent unit (e.g. raw 16.16 fixed-point) — only the
+    /// ratios between slow and fast buckets matter.  Maintains two learned buckets:
+    /// `compare_delta_slow` (100 Hz, seeded on first call) and `compare_delta_fast`
+    /// (~10x smaller, 1 kHz).  All comparisons use ±5% fuzzy equality.
+    /// Returns `Some(target_ns)` or `None` for a zero/degenerate delta.
+    fn bin_compare_delta(&mut self, d: u64) -> Option<u64> {
+        if d == 0 {
+            return None;
+        }
+        // ±5% fuzzy equality.
+        let fuzzy_eq = |a: u64, b: u64| -> bool {
+            let threshold = a.max(b) * 5 / 100;
+            a.abs_diff(b) <= threshold
+        };
+
+        if self.compare_delta_slow == 0 {
+            // First delta ever — seed slow bucket, assume 100 Hz.
+            self.compare_delta_slow = d;
+            return Some(10_000_000);
+        }
+
+        if fuzzy_eq(d, self.compare_delta_slow) {
+            return Some(10_000_000);
+        }
+
+        if self.compare_delta_fast != 0 && fuzzy_eq(d, self.compare_delta_fast) {
+            return Some(1_000_000);
+        }
+
+        // Check if d ≈ slow/10 (i.e. ~10x smaller → fast tick).
+        if fuzzy_eq(d * 10, self.compare_delta_slow) {
+            self.compare_delta_fast = d;
+            return Some(1_000_000);
+        }
+
+        if d > self.compare_delta_slow {
+            // Larger than slow — one-shot or low-freq timer; update slow bucket.
+            self.compare_delta_slow = d;
+            Some(10_000_000)
+        } else {
+            // Unrecognised intermediate — fall back to slow.
+            Some(10_000_000)
+        }
+    }
+
     /// Write CP0 register by index.
     /// When reg 12 (Status) is written, invokes `status_changed_cb` with (old, new).
     pub fn write_cp0(&mut self, reg: u32, value: u64) {
@@ -485,44 +546,45 @@ impl MipsCore {
                 if self.compare_last_cycles != 0 {
                     let dc = cycles_now.wrapping_sub(self.compare_last_cycles);
                     let dt_ns = now.duration_since(self.compare_last_instant).as_nanos() as u64;
-                    let delta = self.cp0_compare.wrapping_sub(self.cp0_count);
-                    // Record delta in frequency map (rounded to nearest 100 hw-counts).
+                    // New delta being programmed (what the *next* interval will fire at),
+                    // stored as raw 16.16 fixed-point for use in the next calibration.
+                    let new_delta = self.cp0_compare.wrapping_sub(self.cp0_count);
                     #[cfg(feature = "developer_ip7")]
                     {
-                        let bucket = ((delta >> 16) as u32 / 100) * 100;
+                        let bucket = ((new_delta >> 16) as u32 / 100) * 100;
                         *self.compare_delta_stats.entry(bucket).or_insert(0) += 1;
                     }
-                    // Snap the intended tick period to 1ms or 10ms based on estimated target:
-                    //   target_ns = delta * 2 * dt_ns / dc
-                    // then use that as the denominator multiplier instead of a fixed 1_000_000.
-                    const TARGET_1MS:  u64 = 1_000_000;
-                    const TARGET_10MS: u64 = 10_000_000;
-                    if dc > 0 {
-                        let target_ns = delta.saturating_mul(dt_ns) / dc * 2;
-                        // If estimated target is under 3ms, treat as 1kHz tick, else 100Hz.
-                        let snapped_ns = if (target_ns >> 16) < 3_000_000 {
-                            TARGET_1MS
-                        } else {
-                            TARGET_10MS
-                        };
-                        let denom = dc.saturating_mul(snapped_ns);
-                        self.count_step = (delta.saturating_mul(dt_ns) / denom)
-                            .clamp(1 << 12, 10 << 15);
-                        #[cfg(feature = "developer_ip7")]
-                        {
-                            let total_samples: u32 = self.compare_delta_stats.values().sum();
-                            if total_samples <= 5 {
-                                eprintln!("compare calib: delta={} dt_ns={} dc={} target_ns={} ({}ms) snapped={}ms count_step={}",
-                                    delta >> 16, dt_ns, dc,
-                                    target_ns >> 16, (target_ns >> 16) / 1_000_000,
-                                    snapped_ns / 1_000_000,
-                                    self.count_step);
+                    // dt_ns/dc measure the interval since the last Compare write, which
+                    // ran under compare_delta_prev.  Calibrate against that, not new_delta,
+                    // so a tick-rate switch doesn't mix old timing with the new delta.
+                    // If there was no previous delta (first write after reset), skip.
+                    let prev_delta = self.compare_delta_prev;
+                    if prev_delta != 0 {
+                        if let Some(snapped_ns) = self.bin_compare_delta(prev_delta) {
+                            if dc > 0 {
+                                let denom = dc.saturating_mul(snapped_ns);
+                                self.count_step = (prev_delta.saturating_mul(dt_ns) / denom)
+                                    .clamp(1 << 12, 10 << 15);
+                                #[cfg(feature = "developer_ip7")]
+                                {
+                                    let total_samples: u32 = self.compare_delta_stats.values().sum();
+                                    if total_samples <= 10 {
+                                        eprintln!("compare calib: prev_d={} new_d={} dt_ns={} dc={} \
+                                            snapped={}ms slow={} fast={} count_step={}",
+                                            prev_delta >> 16, new_delta >> 16, dt_ns, dc,
+                                            snapped_ns / 1_000_000,
+                                            self.compare_delta_slow >> 16,
+                                            self.compare_delta_fast >> 16,
+                                            self.count_step);
+                                    }
+                                }
+                            } else {
+                                self.count_step = 1 << 15;
                             }
+                            self.count_step_atomic.store(self.count_step, Ordering::Relaxed);
                         }
-                    } else {
-                        self.count_step = 1 << 15;
                     }
-                    self.count_step_atomic.store(self.count_step, Ordering::Relaxed);
+                    self.compare_delta_prev = new_delta;
                 }
                 // First write: keep default count_step (1<<15), just record state.
                 self.compare_last_cycles = cycles_now;
