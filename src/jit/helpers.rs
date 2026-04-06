@@ -6,7 +6,7 @@
 //! optimizations that cause stale reads.
 
 use super::context::{JitContext, EXIT_EXCEPTION};
-use crate::mips_exec::{MipsExecutor, MemAccessSize, EXEC_COMPLETE};
+use crate::mips_exec::{MipsExecutor, EXEC_COMPLETE};
 use crate::mips_tlb::Tlb;
 use crate::mips_cache_v2::MipsCache;
 
@@ -29,7 +29,7 @@ pub extern "C" fn jit_read_u8<T: Tlb, C: MipsCache>(
 ) -> u64 {
     let exec = unsafe { &mut *opaque_exec::<T, C>(exec_ptr) };
     let ctx = unsafe { &mut *opaque_ctx(ctx_ptr) };
-    match exec.read_data(virt_addr, MemAccessSize::Byte) {
+    match exec.read_data::<1>(virt_addr) {
         Ok(value) => value,
         Err(status) => { ctx.exit_reason = EXIT_EXCEPTION; ctx.exception_status = status; 0 }
     }
@@ -40,7 +40,7 @@ pub extern "C" fn jit_read_u16<T: Tlb, C: MipsCache>(
 ) -> u64 {
     let exec = unsafe { &mut *opaque_exec::<T, C>(exec_ptr) };
     let ctx = unsafe { &mut *opaque_ctx(ctx_ptr) };
-    match exec.read_data(virt_addr, MemAccessSize::Half) {
+    match exec.read_data::<2>(virt_addr) {
         Ok(value) => value,
         Err(status) => { ctx.exit_reason = EXIT_EXCEPTION; ctx.exception_status = status; 0 }
     }
@@ -51,7 +51,7 @@ pub extern "C" fn jit_read_u32<T: Tlb, C: MipsCache>(
 ) -> u64 {
     let exec = unsafe { &mut *opaque_exec::<T, C>(exec_ptr) };
     let ctx = unsafe { &mut *opaque_ctx(ctx_ptr) };
-    match exec.read_data(virt_addr, MemAccessSize::Word) {
+    match exec.read_data::<4>(virt_addr) {
         Ok(value) => value,
         Err(status) => { ctx.exit_reason = EXIT_EXCEPTION; ctx.exception_status = status; 0 }
     }
@@ -62,7 +62,7 @@ pub extern "C" fn jit_read_u64<T: Tlb, C: MipsCache>(
 ) -> u64 {
     let exec = unsafe { &mut *opaque_exec::<T, C>(exec_ptr) };
     let ctx = unsafe { &mut *opaque_ctx(ctx_ptr) };
-    match exec.read_data(virt_addr, MemAccessSize::Double) {
+    match exec.read_data::<8>(virt_addr) {
         Ok(value) => value,
         Err(status) => { ctx.exit_reason = EXIT_EXCEPTION; ctx.exception_status = status; 0 }
     }
@@ -75,7 +75,7 @@ pub extern "C" fn jit_write_u8<T: Tlb, C: MipsCache>(
 ) -> u64 {
     let exec = unsafe { &mut *opaque_exec::<T, C>(exec_ptr) };
     let ctx = unsafe { &mut *opaque_ctx(ctx_ptr) };
-    let status = exec.write_data(virt_addr, value, MemAccessSize::Byte, 0xFF);
+    let status = exec.write_data::<1>(virt_addr, value);
     if status != EXEC_COMPLETE { ctx.exit_reason = EXIT_EXCEPTION; ctx.exception_status = status; }
     0
 }
@@ -85,7 +85,7 @@ pub extern "C" fn jit_write_u16<T: Tlb, C: MipsCache>(
 ) -> u64 {
     let exec = unsafe { &mut *opaque_exec::<T, C>(exec_ptr) };
     let ctx = unsafe { &mut *opaque_ctx(ctx_ptr) };
-    let status = exec.write_data(virt_addr, value, MemAccessSize::Half, 0xFFFF);
+    let status = exec.write_data::<2>(virt_addr, value);
     if status != EXEC_COMPLETE { ctx.exit_reason = EXIT_EXCEPTION; ctx.exception_status = status; }
     0
 }
@@ -95,7 +95,7 @@ pub extern "C" fn jit_write_u32<T: Tlb, C: MipsCache>(
 ) -> u64 {
     let exec = unsafe { &mut *opaque_exec::<T, C>(exec_ptr) };
     let ctx = unsafe { &mut *opaque_ctx(ctx_ptr) };
-    let status = exec.write_data(virt_addr, value, MemAccessSize::Word, 0xFFFF_FFFF);
+    let status = exec.write_data::<4>(virt_addr, value);
     if status != EXEC_COMPLETE { ctx.exit_reason = EXIT_EXCEPTION; ctx.exception_status = status; }
     0
 }
@@ -105,8 +105,27 @@ pub extern "C" fn jit_write_u64<T: Tlb, C: MipsCache>(
 ) -> u64 {
     let exec = unsafe { &mut *opaque_exec::<T, C>(exec_ptr) };
     let ctx = unsafe { &mut *opaque_ctx(ctx_ptr) };
-    let status = exec.write_data(virt_addr, value, MemAccessSize::Double, 0xFFFF_FFFF_FFFF_FFFF);
+    let status = exec.write_data::<8>(virt_addr, value);
     if status != EXEC_COMPLETE { ctx.exit_reason = EXIT_EXCEPTION; ctx.exception_status = status; }
+    0
+}
+
+// ─── Interpreter fallback ────────────────────────────────────────────────────
+
+/// Execute one interpreter step for a delay slot that can't be compiled at
+/// the current JIT tier. The caller (JIT block) has already flushed modified
+/// GPRs and set ctx.pc to the delay slot PC. This function:
+/// 1. Syncs JitContext → executor (so interpreter sees JIT's register state)
+/// 2. Calls exec.step() (executes the instruction + full bookkeeping)
+/// 3. Syncs executor → JitContext (so JIT sees the result, e.g. loaded value)
+pub extern "C" fn jit_interp_one_step<T: Tlb, C: MipsCache>(
+    ctx_ptr: *mut JitContext, exec_ptr: *mut u8,
+) -> u64 {
+    let exec = unsafe { &mut *opaque_exec::<T, C>(exec_ptr) };
+    let ctx = unsafe { &mut *opaque_ctx(ctx_ptr) };
+    ctx.sync_to_executor(exec);
+    exec.step();
+    ctx.sync_from_executor(exec);
     0
 }
 
@@ -120,6 +139,7 @@ pub struct HelperPtrs {
     pub write_u16: *const u8,
     pub write_u32: *const u8,
     pub write_u64: *const u8,
+    pub interp_step: *const u8,
 }
 
 impl HelperPtrs {
@@ -133,6 +153,7 @@ impl HelperPtrs {
             write_u16: jit_write_u16::<T, C> as *const u8,
             write_u32: jit_write_u32::<T, C> as *const u8,
             write_u64: jit_write_u64::<T, C> as *const u8,
+            interp_step: jit_interp_one_step::<T, C> as *const u8,
         }
     }
 }

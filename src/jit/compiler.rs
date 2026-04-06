@@ -29,6 +29,7 @@ pub struct BlockCompiler {
     fn_write_u16: FuncId,
     fn_write_u32: FuncId,
     fn_write_u64: FuncId,
+    fn_interp_step: FuncId,
 }
 
 impl BlockCompiler {
@@ -51,6 +52,7 @@ impl BlockCompiler {
         jit_builder.symbol("jit_write_u16", helpers.write_u16);
         jit_builder.symbol("jit_write_u32", helpers.write_u32);
         jit_builder.symbol("jit_write_u64", helpers.write_u64);
+        jit_builder.symbol("jit_interp_step", helpers.interp_step);
 
         let mut jit_module = JITModule::new(jit_builder);
 
@@ -81,6 +83,13 @@ impl BlockCompiler {
         let fn_write_u32 = jit_module.declare_function("jit_write_u32", Linkage::Import, &write_sig).unwrap();
         let fn_write_u64 = jit_module.declare_function("jit_write_u64", Linkage::Import, &write_sig).unwrap();
 
+        // interp_step(ctx_ptr, exec_ptr) -> u64
+        let mut step_sig = jit_module.make_signature();
+        step_sig.params.push(AbiParam::new(ptr_type)); // ctx_ptr
+        step_sig.params.push(AbiParam::new(ptr_type)); // exec_ptr
+        step_sig.returns.push(AbiParam::new(types::I64));
+        let fn_interp_step = jit_module.declare_function("jit_interp_step", Linkage::Import, &step_sig).unwrap();
+
         Self {
             ctx: jit_module.make_context(),
             jit_module,
@@ -88,6 +97,7 @@ impl BlockCompiler {
             func_id_counter: 0,
             fn_read_u8, fn_read_u16, fn_read_u32, fn_read_u64,
             fn_write_u8, fn_write_u16, fn_write_u32, fn_write_u64,
+            fn_interp_step,
         }
     }
 
@@ -146,6 +156,7 @@ impl BlockCompiler {
             write_u16: self.jit_module.declare_func_in_func(self.fn_write_u16, &mut builder.func),
             write_u32: self.jit_module.declare_func_in_func(self.fn_write_u32, &mut builder.func),
             write_u64: self.jit_module.declare_func_in_func(self.fn_write_u64, &mut builder.func),
+            interp_step: self.jit_module.declare_func_in_func(self.fn_interp_step, &mut builder.func),
         };
 
         // Load GPRs 1-31 from JitContext (gpr[0] is always 0)
@@ -191,8 +202,36 @@ impl BlockCompiler {
                             &mut builder, ctx_ptr, exec_ptr, &helpers,
                             &mut gpr, &mut hi, &mut lo, &mut modified_gprs, delay_d, delay_pc, tier,
                         );
-                        if matches!(delay_result, EmitResult::Ok) {
-                            compiled_count += 1;
+                        match delay_result {
+                            EmitResult::Ok => { compiled_count += 1; }
+                            EmitResult::Stop => {
+                                // Delay slot can't be compiled at this tier — interpreter fallback.
+                                // Flush all modified GPRs to ctx so interpreter sees current state.
+                                flush_modified_gprs(&mut builder, &gpr, ctx_ptr, &mut modified_gprs);
+                                builder.ins().store(mem, hi, ctx_ptr,
+                                    ir::immediates::Offset32::new(JitContext::hi_offset()));
+                                builder.ins().store(mem, lo, ctx_ptr,
+                                    ir::immediates::Offset32::new(JitContext::lo_offset()));
+                                // Store delay slot PC so interpreter executes the right instruction
+                                let delay_pc_val = builder.ins().iconst(types::I64, delay_pc as i64);
+                                builder.ins().store(mem, delay_pc_val, ctx_ptr,
+                                    ir::immediates::Offset32::new(JitContext::pc_offset()));
+                                // Call interpreter: syncs ctx→exec, step(), syncs exec→ctx
+                                builder.ins().call(helpers.interp_step, &[ctx_ptr, exec_ptr]);
+                                // Reload GPRs from ctx (interpreter may have modified any register)
+                                for i in 1..32usize {
+                                    gpr[i] = builder.ins().load(
+                                        types::I64, mem, ctx_ptr,
+                                        ir::immediates::Offset32::new(JitContext::gpr_offset(i)),
+                                    );
+                                }
+                                hi = builder.ins().load(types::I64, mem, ctx_ptr,
+                                    ir::immediates::Offset32::new(JitContext::hi_offset()));
+                                lo = builder.ins().load(types::I64, mem, ctx_ptr,
+                                    ir::immediates::Offset32::new(JitContext::lo_offset()));
+                                compiled_count += 1;
+                            }
+                            _ => {} // Branch in delay slot — shouldn't happen
                         }
                     }
                     branch_exit_pc = Some(target_val);
@@ -257,7 +296,12 @@ impl BlockCompiler {
             len_mips: compiled_count,
             len_native: code_size,
             tier,
-            speculative: true,
+            // Full-tier blocks contain stores that modify memory. Speculative
+            // rollback restores CPU/TLB state but NOT memory, so read-modify-write
+            // sequences get double-applied on rollback. Non-speculative blocks skip
+            // snapshot/rollback — on exception, the store emitter's flushed GPRs and
+            // faulting PC (already in executor via sync_to) are used directly.
+            speculative: tier != BlockTier::Full,
             hit_count: 0,
             exception_count: 0,
             stable_hits: 0,
@@ -269,6 +313,7 @@ impl BlockCompiler {
 struct EmitHelpers {
     read_u8: FuncRef, read_u16: FuncRef, read_u32: FuncRef, read_u64: FuncRef,
     write_u8: FuncRef, write_u16: FuncRef, write_u32: FuncRef, write_u64: FuncRef,
+    interp_step: FuncRef,
 }
 
 /// Result of emitting a single instruction.

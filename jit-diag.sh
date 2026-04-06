@@ -7,30 +7,33 @@
 #         "interp"   — pure interpreter (no JIT feature, baseline)
 #         "perf"     — perf profile, interpreter only (text report for analysis)
 #         "perf-jit" — perf profile with JIT enabled
+#
+# All IRIS_JIT_* env vars are passed through automatically:
+#   IRIS_JIT_MAX_TIER=0 ./jit-diag.sh jit
+#   IRIS_JIT_PROBE=500 IRIS_JIT_PROBE_MIN=100 ./jit-diag.sh jit
 
 MODE="${1:-jit}"
-# IRIS_JIT_MAX_TIER from environment (0=Alu, 1=Loads, 2=Full, unset=Full)
-TIER_ENV=""
-if [ -n "$IRIS_JIT_MAX_TIER" ]; then
-  TIER_ENV="IRIS_JIT_MAX_TIER=$IRIS_JIT_MAX_TIER"
-fi
 OUTFILE="jit-diag-$(date +%Y%m%d-%H%M%S)-${MODE}.log"
+
+# Collect all IRIS_JIT_* env vars for display and passthrough
+JIT_VARS=$(env | grep '^IRIS_JIT_' | tr '\n' ' ')
 
 echo "=== IRIS JIT Diagnostic ===" | tee "$OUTFILE"
 echo "Mode: $MODE" | tee -a "$OUTFILE"
 echo "Date: $(date)" | tee -a "$OUTFILE"
 echo "Host: $(uname -m) $(uname -s) $(uname -r)" | tee -a "$OUTFILE"
 echo "Rust: $(rustc --version)" | tee -a "$OUTFILE"
+[ -n "$JIT_VARS" ] && echo "Env: $JIT_VARS" | tee -a "$OUTFILE"
 echo "" | tee -a "$OUTFILE"
 
 case "$MODE" in
   jit)
-    echo "Running: IRIS_JIT=1 $TIER_ENV cargo run --release --features jit,lightning" | tee -a "$OUTFILE"
-    IRIS_JIT=1 $TIER_ENV cargo run --release --features jit,lightning 2>&1 | tee -a "$OUTFILE"
+    echo "Running: IRIS_JIT=1 ${JIT_VARS}cargo run --release --features jit,lightning" | tee -a "$OUTFILE"
+    IRIS_JIT=1 cargo run --release --features jit,lightning 2>&1 | tee -a "$OUTFILE"
     ;;
   verify)
-    echo "Running: IRIS_JIT=1 IRIS_JIT_VERIFY=1 $TIER_ENV cargo run --release --features jit,lightning" | tee -a "$OUTFILE"
-    IRIS_JIT=1 IRIS_JIT_VERIFY=1 $TIER_ENV cargo run --release --features jit,lightning 2>&1 | tee -a "$OUTFILE"
+    echo "Running: IRIS_JIT=1 IRIS_JIT_VERIFY=1 ${JIT_VARS}cargo run --release --features jit,lightning" | tee -a "$OUTFILE"
+    IRIS_JIT=1 IRIS_JIT_VERIFY=1 cargo run --release --features jit,lightning 2>&1 | tee -a "$OUTFILE"
     ;;
   nojit)
     echo "Running: cargo run --release --features jit,lightning (no IRIS_JIT)" | tee -a "$OUTFILE"

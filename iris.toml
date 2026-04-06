@@ -15,7 +15,7 @@ prom = "prom.bin"
 
 # Window scale factor: 1 = native resolution, 2 = 2× for HiDPI/4K monitors.
 # Can also be set with the --2x command-line flag (CLI takes precedence).
-scale = 2
+scale = 1
 
 # RAM bank sizes in MB.
 # Each bank must be 0 (absent), 8, 16, 32, 64, or 128.

@@ -6,7 +6,7 @@ fn main() {
     let headless = cfg.headless;
 
     // Start unfsd before the machine so NFS is ready when IRIX boots.
-    let nfs_proc = cfg.nfs.as_ref().map(|nfs| start_unfsd(nfs));
+    let nfs_proc = cfg.nfs.as_ref().and_then(|nfs| start_unfsd(nfs));
 
     // Machine::new() allocates >1MB on the stack (Physical device_map), which overflows
     // the default stack on Windows (1MB). We spawn a thread with a larger stack to create it.
@@ -80,7 +80,7 @@ impl UnfsdProc {
     }
 }
 
-fn start_unfsd(nfs: &NfsConfig) -> UnfsdProc {
+fn start_unfsd(nfs: &NfsConfig) -> Option<UnfsdProc> {
     use std::io::Write as _;
 
     // NFS requires an absolute path in the exports file.
@@ -98,7 +98,7 @@ fn start_unfsd(nfs: &NfsConfig) -> UnfsdProc {
 
     let pid_path = std::env::temp_dir().join("iris_nfs.pid");
 
-    let child = std::process::Command::new(&nfs.unfsd)
+    let child = match std::process::Command::new(&nfs.unfsd)
         .arg("-u")                                       // don't require root
         .arg("-p")                                       // don't register with host portmap
         .arg("-3")                                       // truncate fileid/cookie to 32 bits (IRIX compat)
@@ -108,7 +108,13 @@ fn start_unfsd(nfs: &NfsConfig) -> UnfsdProc {
         .arg("-e").arg(&exports_path)
         .arg("-i").arg(&pid_path)
         .spawn()
-        .unwrap_or_else(|e| panic!("failed to start unfsd '{}': {}", nfs.unfsd, e));
+    {
+        Ok(child) => child,
+        Err(e) => {
+            eprintln!("iris: warning: failed to start unfsd '{}': {} (NFS sharing disabled)", nfs.unfsd, e);
+            return None;
+        }
+    };
 
     eprintln!("iris: unfsd started (pid {}) nfs=127.0.0.1:{} mountd=127.0.0.1:{} dir={}",
               child.id(), nfs.nfs_host_port, nfs.mountd_host_port, abs_dir.display());
@@ -120,8 +126,8 @@ fn start_unfsd(nfs: &NfsConfig) -> UnfsdProc {
     { let mut c = child; let _ = c.wait(); }
 
     #[cfg(windows)]
-    return UnfsdProc { child };
+    return Some(UnfsdProc { child });
 
     #[cfg(not(windows))]
-    return UnfsdProc { pid_path };
+    return Some(UnfsdProc { pid_path });
 }

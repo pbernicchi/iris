@@ -30,7 +30,6 @@ pub struct CpuRollbackSnapshot {
     pub in_delay_slot: bool,
     pub delay_slot_target: u64,
     pub cached_pending: u64,
-    pub interrupt_check_counter: u8,
     pub tlb: MipsTlb,
 }
 
@@ -59,7 +58,6 @@ impl CpuRollbackSnapshot {
             in_delay_slot:     exec.in_delay_slot,
             delay_slot_target: exec.delay_slot_target,
             cached_pending:    exec.cached_pending,
-            interrupt_check_counter: exec.interrupt_check_counter,
             tlb,
         }
     }
@@ -86,7 +84,6 @@ impl CpuRollbackSnapshot {
         exec.in_delay_slot     = self.in_delay_slot;
         exec.delay_slot_target = self.delay_slot_target;
         exec.cached_pending    = self.cached_pending;
-        exec.interrupt_check_counter = self.interrupt_check_counter;
         exec.tlb.restore_from_mips_tlb(&self.tlb);
     }
 

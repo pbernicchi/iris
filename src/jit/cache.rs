@@ -27,9 +27,30 @@ impl BlockTier {
     }
 }
 
+// Defaults; overridden by IRIS_JIT_STABLE / IRIS_JIT_PROMOTE / IRIS_JIT_DEMOTE env vars.
 pub const TIER_STABLE_THRESHOLD:  u32 = 50;   // consecutive clean exits → trusted
 pub const TIER_PROMOTE_THRESHOLD: u32 = 200;  // trusted clean exits → try next tier
 pub const TIER_DEMOTE_THRESHOLD:  u32 = 3;    // exceptions in trial period → demote
+
+/// Runtime-configurable tier thresholds. Reads env vars once at init.
+pub struct TierConfig {
+    pub stable:  u32,
+    pub promote: u32,
+    pub demote:  u32,
+}
+
+impl TierConfig {
+    pub fn from_env() -> Self {
+        Self {
+            stable:  std::env::var("IRIS_JIT_STABLE").ok()
+                .and_then(|v| v.parse().ok()).unwrap_or(TIER_STABLE_THRESHOLD),
+            promote: std::env::var("IRIS_JIT_PROMOTE").ok()
+                .and_then(|v| v.parse().ok()).unwrap_or(TIER_PROMOTE_THRESHOLD),
+            demote:  std::env::var("IRIS_JIT_DEMOTE").ok()
+                .and_then(|v| v.parse().ok()).unwrap_or(TIER_DEMOTE_THRESHOLD),
+        }
+    }
+}
 
 /// A compiled native code block.
 pub struct CompiledBlock {
