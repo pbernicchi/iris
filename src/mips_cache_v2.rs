@@ -36,6 +36,31 @@ impl FetchInstrResult {
 }
 
 
+// =============================================================================
+// R4400 Architecture Cache Constants
+// =============================================================================
+
+/// Compile-time count-trailing-zeros for usize (stable Rust lacks const trailing_zeros).
+const fn ctz(n: usize) -> u32 {
+    let mut i = 0u32;
+    let mut v = n;
+    while v & 1 == 0 { v >>= 1; i += 1; }
+    i
+}
+
+/// Cache kind discriminant — used as a const generic `u8` parameter on `Cache`.
+#[repr(u8)]
+enum CacheKind { Insn = 0, Data = 1, L2 = 2 }
+
+// R4400 cache sizes and line sizes — fixed for this CPU.
+// Exported so that mips_exec can build CP0 Config without duplicating these values.
+pub const IC_SIZE: usize = 16 * 1024;   // 16 KB L1 instruction cache
+pub const IC_LINE: usize = 16;          // 16-byte lines
+pub const DC_SIZE: usize = 16 * 1024;   // 16 KB L1 data cache
+pub const DC_LINE: usize = 16;          // 16-byte lines
+pub const L2_SIZE: usize = 1024 * 1024; // 1 MB unified L2
+pub const L2_LINE: usize = 128;         // 128-byte lines
+
 // Re-export cache operation constants for convenience
 pub use crate::mips_isa::{
     CACH_PI, CACH_PD, CACH_SI, CACH_SD,
@@ -308,8 +333,8 @@ impl PassthroughCache {
     }
 }
 
-impl From<(Arc<dyn BusDevice>, R4000CacheConfig)> for PassthroughCache {
-    fn from((downstream, _config): (Arc<dyn BusDevice>, R4000CacheConfig)) -> Self {
+impl From<Arc<dyn BusDevice>> for PassthroughCache {
+    fn from(downstream: Arc<dyn BusDevice>) -> Self {
         Self::new(downstream)
     }
 }
@@ -402,168 +427,109 @@ impl<T> CacheVec<T> {
     fn get_mut(&self) -> &mut Vec<T> { unsafe { &mut *self.0.get() } }
 }
 
-/// A single cache level - used for L1-I, L1-D, or L2
+/// A single cache level parameterised by size, line size, and kind (Insn/Data/L2).
 ///
-/// Structure:
-/// - `tags`: Array of size `num_lines` u32 tags (raw; use `get_tag`/`set_tag` for typed access)
-/// - `data`: Array of size `cache_size / 8` u64 values (entire cache data)
-/// - `instrs`: L1-I only — one DecodedInstr per 4-byte instruction slot. Empty for L1-D/L2.
-/// - Various shifts and masks for efficient indexing
-unsafe impl Send for Cache {}
-unsafe impl Sync for Cache {}
-
-struct Cache {
-    /// Cache tags - one u32 per cache line (use get_tag/set_tag for typed access)
-    tags: CacheVec<u32>,
-
-    /// Cache data - stored as u64 chunks
-    data: CacheVec<u64>,
-
-    /// L1-I decoded instruction slots — one per 4-byte word (cache_size / 4 entries).
-    /// Empty (zero-capacity) for L1-D and L2.
+/// All geometry constants are computed at compile time from `SIZE` and `LINE`.
+/// `KIND` (a `CacheKind` discriminant cast to `u8`) controls whether the L2
+/// decoded-instruction array is allocated and which methods are meaningful.
+///
+/// - `tags`: one u32 per cache line (use `get_tag`/`set_tag` for typed access)
+/// - `data`: entire cache as `SIZE/8` u64 chunks
+/// - `instrs`: L2 only — one DecodedInstr per 4-byte word (`SIZE/4` entries); empty otherwise
+struct Cache<const SIZE: usize, const LINE: usize, const KIND: u8> {
+    tags:   CacheVec<u32>,
+    data:   CacheVec<u64>,
+    /// L2 decoded-instruction slots (SIZE/4 entries). Empty for L1-I and L1-D.
     instrs: CacheVec<DecodedInstr>,
-
-    /// Number of 4-byte instruction slots per cache line. Zero for non-I-cache.
-    instrs_per_line: usize,
-
-    /// log2(instrs_per_line): shift to get instr index from byte offset within line.
-    instr_shift: u32,
-
-    /// instrs_per_line - 1: mask for wrapping instr index within a line.
-    instr_mask: usize,
-
     /// Signals the decode thread to stop (kept for Drop compatibility).
-    stop: Arc<AtomicBool>,
-
-    /// Total cache size in bytes
-    cache_size: usize,
-
-    /// Cache line size in bytes
-    line_size: usize,
-
-    /// Number of cache lines
-    num_lines: usize,
-
-    /// Shift to get line index from address (line_size.trailing_zeros())
-    line_shift: u32,
-
-    /// Mask for line size (line_size - 1)
-    line_mask: usize,
-
-    /// Mask for number of lines (num_lines - 1)
-    num_lines_mask: usize,
-
-    /// Shift to get cache size alignment (cache_size.trailing_zeros())
-    cache_size_shift: u32,
-
-    /// Number of u64 chunks per cache line (line_size / 8)
-    chunks_per_line: usize,
-
-    /// Shift to get chunk offset within line (line_shift - 3)
-    chunks_per_line_shift: u32,
+    stop:   Arc<AtomicBool>,
 }
 
-impl Cache {
-    fn new(cache_size: usize, line_size: usize) -> Self {
-        assert!(cache_size.is_power_of_two());
-        assert!(line_size.is_power_of_two());
-        assert!(line_size >= 8);
-        assert!(cache_size >= line_size);
+unsafe impl<const SIZE: usize, const LINE: usize, const KIND: u8> Send for Cache<SIZE, LINE, KIND> {}
+unsafe impl<const SIZE: usize, const LINE: usize, const KIND: u8> Sync for Cache<SIZE, LINE, KIND> {}
 
-        let num_lines = cache_size / line_size;
-        let line_shift = line_size.trailing_zeros();
-        let chunks_per_line = line_size / 8;
+impl<const SIZE: usize, const LINE: usize, const KIND: u8> Cache<SIZE, LINE, KIND> {
+    // ---- Compile-time geometry constants ----
+    const NUM_LINES:             usize = SIZE / LINE;
+    const LINE_SHIFT:            u32   = ctz(LINE);
+    const LINE_MASK:             usize = LINE - 1;
+    const NUM_LINES_MASK:        usize = Self::NUM_LINES - 1;
+    const CACHE_SIZE_SHIFT:      u32   = ctz(SIZE);
+    const CHUNKS_PER_LINE:       usize = LINE / 8;
+    const CHUNKS_PER_LINE_SHIFT: u32   = Self::LINE_SHIFT - 3;
+    /// Instructions per cache line (LINE/4). Valid for Insn and L2 kinds.
+    const INSTRS_PER_LINE:       usize = LINE / 4;
+    /// Shift for instruction index within a line. Valid for Insn and L2 kinds.
+    const INSTR_SHIFT:           u32   = Self::LINE_SHIFT - 2;
+    const INSTR_MASK:            usize = Self::INSTRS_PER_LINE - 1;
 
+    fn new() -> Self {
+        // Allocate L2 decoded-instruction slots only for the L2 cache.
+        let instrs = if KIND == CacheKind::L2 as u8 {
+            (0..SIZE / 4).map(|_| DecodedInstr::default()).collect()
+        } else {
+            Vec::new()
+        };
         Self {
-            tags: CacheVec::new(vec![0; num_lines]),
-            data: CacheVec::new(vec![0; cache_size / 8]),
-            instrs: CacheVec::new(Vec::new()),
-            instrs_per_line: 0,
-            instr_shift: 0,
-            instr_mask: 0,
-            stop: Arc::new(AtomicBool::new(false)),
-            cache_size,
-            line_size,
-            num_lines,
-            line_shift,
-            line_mask: line_size - 1,
-            num_lines_mask: num_lines - 1,
-            cache_size_shift: cache_size.trailing_zeros(),
-            chunks_per_line,
-            chunks_per_line_shift: line_shift - 3,
+            tags:   CacheVec::new(vec![0u32; Self::NUM_LINES]),
+            data:   CacheVec::new(vec![0u64; SIZE / 8]),
+            instrs: CacheVec::new(instrs),
+            stop:   Arc::new(AtomicBool::new(false)),
         }
     }
 
-    /// Initialise the L1-I cache. Call once after construction.
-    /// ic.data is repurposed: stores l2.instrs slot indices (two u32 per u64).
-    /// ic.instrs not used — decoded slots live in l2.instrs.
-    fn init_icache(&mut self) {
-        self.instrs_per_line = self.line_size / 4;
-        self.instr_shift = self.line_shift - 2;
-        self.instr_mask = self.instrs_per_line - 1;
-    }
-
-    /// Initialise L2 decoded-instruction arrays. Call once after construction.
-    fn init_l2cache(&mut self) {
-        let num_slots = self.cache_size / 4;
-        *self.instrs.get_mut() = (0..num_slots).map(|_| DecodedInstr::default()).collect();
-        self.instrs_per_line = self.line_size / 4;
-        self.instr_shift = self.line_shift - 2;
-        self.instr_mask  = self.instrs_per_line - 1;
-    }
-
-    /// Get cache line index from address
-    #[inline]
+    /// Get cache line index from address.
+    #[inline(always)]
     fn get_index(&self, addr: u64) -> usize {
-        ((addr >> self.line_shift) as usize) & self.num_lines_mask
+        ((addr >> Self::LINE_SHIFT) as usize) & Self::NUM_LINES_MASK
     }
 
-    /// Get offset within cache line
-    #[inline]
+    /// Get byte offset within a cache line.
+    #[inline(always)]
     fn get_line_offset(&self, addr: u64) -> usize {
-        (addr as usize) & self.line_mask
+        (addr as usize) & Self::LINE_MASK
     }
 
-    /// Get data chunk index for a given address
-    #[inline]
+    /// Get the u64-chunk index for a given address.
+    #[inline(always)]
     fn get_data_index(&self, addr: u64) -> usize {
         let line_idx = self.get_index(addr);
-        let chunk_offset = self.get_line_offset(addr) >> 3; // divide by 8
-        (line_idx << self.chunks_per_line_shift) + chunk_offset
+        let chunk_offset = self.get_line_offset(addr) >> 3;
+        (line_idx << Self::CHUNKS_PER_LINE_SHIFT) + chunk_offset
     }
 
-    /// Read the tag at `idx` as a typed bitfield struct
-    #[inline]
+    /// Read the tag at `idx` as a typed bitfield struct.
+    #[inline(always)]
     fn get_tag<T: From<u32>>(&self, idx: usize) -> T {
         T::from(self.tags.get()[idx])
     }
 
-    /// Write a typed bitfield tag to `idx`
-    #[inline]
+    /// Write a typed bitfield tag to `idx`.
+    #[inline(always)]
     fn set_tag<T: Into<u32>>(&self, idx: usize, tag: T) {
         self.tags.get_mut()[idx] = tag.into();
     }
 
-    /// View ic.data as a flat &[u32] slice (two slot indices per u64, big-endian word order).
-    /// On a little-endian host the packing `(idx0 << 32) | idx1` means idx1 is at even
-    /// u32 offset and idx0 is at odd — so XOR the word index with 1 to address naturally.
-    #[inline]
+    /// View cache data as a flat &[u32] (two per u64, big-endian word order).
+    /// XOR word index with 1 to address naturally on a little-endian host.
+    /// Used by the I-cache to store l2.instrs slot indices.
+    #[inline(always)]
     fn data_as_words(&self) -> &[u32] {
         let slice = self.data.get();
         unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const u32, slice.len() * 2) }
     }
 
-    /// View cache data as flat &[u16] (big-endian halfword order within each u64).
+    /// View cache data as a flat &[u16] (big-endian halfword order within each u64).
     /// XOR halfword index with 3 to convert MIPS big-endian address to host offset.
-    #[inline]
+    #[inline(always)]
     fn data_as_halves(&self) -> &[u16] {
         let slice = self.data.get();
         unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const u16, slice.len() * 4) }
     }
 
-    /// View cache data as flat &[u8] (big-endian byte order within each u64).
+    /// View cache data as a flat &[u8] (big-endian byte order within each u64).
     /// XOR byte index with 7 to convert MIPS big-endian address to host offset.
-    #[inline]
+    #[inline(always)]
     fn data_as_bytes(&self) -> &[u8] {
         let slice = self.data.get();
         unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const u8, slice.len() * 8) }
@@ -574,34 +540,6 @@ impl Cache {
 // R4000 Cache Implementation - Full 2-level hierarchy
 // =============================================================================
 
-/// Configuration for R4000 cache
-#[derive(Clone, Copy, Debug)]
-pub struct R4000CacheConfig {
-    // L1 Instruction Cache
-    pub ic_size: usize,
-    pub ic_line_size: usize,
-
-    // L1 Data Cache
-    pub dc_size: usize,
-    pub dc_line_size: usize,
-
-    // L2 Unified Cache
-    pub l2_size: usize,
-    pub l2_line_size: usize,
-}
-
-impl Default for R4000CacheConfig {
-    fn default() -> Self {
-        Self {
-            ic_size: 16 * 1024,      // 16KB
-            ic_line_size: 16,
-            dc_size: 16 * 1024,      // 16KB
-            dc_line_size: 16,
-            l2_size: 1024 * 1024,    // 1MB
-            l2_line_size: 128,
-        }
-    }
-}
 
 // Debug configuration - set to Some(phys_addr) to enable cache line tracking
 #[cfg(feature = "debug_cache")]
@@ -616,14 +554,14 @@ const DEBUG_TRACK_ADDR: Option<u64> = None;
 pub struct R4000Cache {
     downstream: Arc<dyn BusDevice>,
 
-    // L1 Instruction Cache
-    ic: Cache,
+    // L1 Instruction Cache (16 KB, 16-byte lines)
+    ic: Cache<IC_SIZE, IC_LINE, { CacheKind::Insn as u8 }>,
 
-    // L1 Data Cache
-    dc: Cache,
+    // L1 Data Cache (16 KB, 16-byte lines)
+    dc: Cache<DC_SIZE, DC_LINE, { CacheKind::Data as u8 }>,
 
-    // L2 Unified Cache
-    l2: Cache,
+    // L2 Unified Cache (1 MB, 128-byte lines)
+    l2: Cache<L2_SIZE, L2_LINE, { CacheKind::L2 as u8 }>,
 
     // Load-Linked / Store-Conditional support
     llbit: UnsafeCell<bool>,
@@ -654,20 +592,23 @@ pub struct R4000Cache {
 unsafe impl Send for R4000Cache {}
 unsafe impl Sync for R4000Cache {}
 
+// Type aliases for the concrete cache instances, for brevity in R4000Cache impls.
+type ICache = Cache<IC_SIZE, IC_LINE, { CacheKind::Insn as u8 }>;
+type DCache = Cache<DC_SIZE, DC_LINE, { CacheKind::Data as u8 }>;
+type L2Cache = Cache<L2_SIZE, L2_LINE, { CacheKind::L2 as u8 }>;
+
 impl R4000Cache {
-    pub fn new(downstream: Arc<dyn BusDevice>, config: R4000CacheConfig) -> Self {
-        let mut ic = Cache::new(config.ic_size, config.ic_line_size);
-        ic.init_icache();
-        let dc = Cache::new(config.dc_size, config.dc_line_size);
-        let mut l2 = Cache::new(config.l2_size, config.l2_line_size);
-        l2.init_l2cache();
+    pub fn new(downstream: Arc<dyn BusDevice>) -> Self {
+        let ic = ICache::new();
+        let dc = DCache::new();
+        let l2 = L2Cache::new();
 
         #[cfg(feature = "debug_cache")]
         let (debug_l1d_line, debug_l2_line, debug_companion_l1d_line, debug_companion_l2_line,
              debug_l1d_idx, debug_l2_idx, debug_companion_l2_idx) = {
             if let Some(addr) = DEBUG_TRACK_ADDR {
-                let l1_line_mask = dc.line_mask as u64;
-                let l2_line_mask = l2.line_mask as u64;
+                let l1_line_mask = DCache::LINE_MASK as u64;
+                let l2_line_mask = L2Cache::LINE_MASK as u64;
                 let companion_addr = addr ^ 0x00400000; // XOR with COMPANION_BIT
 
                 let target_l1d_line = addr & !l1_line_mask;
@@ -721,9 +662,9 @@ impl R4000Cache {
 }
 
 
-impl From<(Arc<dyn BusDevice>, R4000CacheConfig)> for R4000Cache {
-    fn from((downstream, config): (Arc<dyn BusDevice>, R4000CacheConfig)) -> Self {
-        Self::new(downstream, config)
+impl From<Arc<dyn BusDevice>> for R4000Cache {
+    fn from(downstream: Arc<dyn BusDevice>) -> Self {
+        Self::new(downstream)
     }
 }
 
@@ -733,7 +674,7 @@ impl R4000Cache {
     #[inline]
     fn is_tracking_l1d(&self, phys_addr: u64) -> bool {
         DEBUG_TRACK_ADDR.is_some() && {
-            let line = phys_addr & !(self.dc.line_mask as u64);
+            let line = phys_addr & !(DCache::LINE_MASK as u64);
             line == self.debug_l1d_line || line == self.debug_companion_l1d_line
         }
     }
@@ -742,7 +683,7 @@ impl R4000Cache {
     #[inline]
     fn is_tracking_l2(&self, phys_addr: u64) -> bool {
         DEBUG_TRACK_ADDR.is_some() && {
-            let line = phys_addr & !(self.l2.line_mask as u64);
+            let line = phys_addr & !(L2Cache::LINE_MASK as u64);
             line == self.debug_l2_line || line == self.debug_companion_l2_line
         }
     }
@@ -764,7 +705,7 @@ impl R4000Cache {
     fn is_tracking_addr(&self, virt_addr: u64, phys_addr: u64) -> bool {
         DEBUG_TRACK_ADDR.is_some() && {
             // Check if the physical line matches (most reliable)
-            let line = phys_addr & !(self.dc.line_mask as u64);
+            let line = phys_addr & !(DCache::LINE_MASK as u64);
             if line == self.debug_l1d_line || line == self.debug_companion_l1d_line {
                 return true;
             }
@@ -783,7 +724,7 @@ impl R4000Cache {
     #[cfg(feature = "debug_cache")]
     #[inline]
     fn tracking_label(&self, phys_addr: u64) -> &'static str {
-        let line = phys_addr & !(self.dc.line_mask as u64);
+        let line = phys_addr & !(DCache::LINE_MASK as u64);
         if line == self.debug_l1d_line {
             "TARGET"
         } else if line == self.debug_companion_l1d_line {
@@ -837,14 +778,16 @@ impl R4000Cache {
     /// L2 line.  The caller iterates over `l1_lines_per_l2` indices starting here,
     /// stepping by 1 (indices wrap naturally via the cache mask).
     #[inline]
-    fn l2_idx_to_l1_base_idx(&self, l2_idx: usize, pidx: u32, l1: &Cache) -> usize {
+    fn l2_idx_to_l1_base_idx<const L1_SIZE: usize, const L1_LINE: usize, const L1_KIND: u8>(
+        &self, l2_idx: usize, pidx: u32, _l1: &Cache<L1_SIZE, L1_LINE, L1_KIND>
+    ) -> usize {
         // Physical bits of the L2 line start address that are below bit 12 (page boundary)
         // These bits are the same in VA and PA, so we can derive them from the L2 index.
-        let l2_line_shift = self.l2.line_shift;
-        let phys_sub_bits = (l2_idx << l2_line_shift as usize) & 0xFFF; // bits [11:0] of L2 line start
+        let phys_sub_bits = (l2_idx << L2Cache::LINE_SHIFT as usize) & 0xFFF;
         // Reconstruct the virtual address bits used for L1 indexing
         let virt_index_bits = ((pidx as usize) << L2_PIDX_VADDR_SHIFT as usize) | phys_sub_bits;
-        (virt_index_bits >> l1.line_shift as usize) & l1.num_lines_mask
+        (virt_index_bits >> Cache::<L1_SIZE, L1_LINE, L1_KIND>::LINE_SHIFT as usize)
+            & Cache::<L1_SIZE, L1_LINE, L1_KIND>::NUM_LINES_MASK
     }
 
     /// Check if the given physical address overlaps with the Load Linked address.
@@ -871,7 +814,7 @@ impl R4000Cache {
         {
             let tag: L1ITag = self.ic.get_tag(idx);
             if tag.valid() {
-                let phys_addr = l1_tag_to_phys(tag, (idx << self.ic.line_shift) as u64);
+                let phys_addr = l1_tag_to_phys(tag, (idx << ICache::LINE_SHIFT) as u64);
                 if self.is_tracking_l1d(phys_addr) {
                     println!("[CACHE DEBUG] invalidate_l1i_line: {} idx={}, phys_addr=0x{:08x}, ptag=0x{:06x}",
                              self.tracking_label(phys_addr), idx, phys_addr, tag.ptag());
@@ -891,7 +834,7 @@ impl R4000Cache {
         #[cfg(feature = "debug_cache")]
         if self.is_tracking_l1d_idx(idx) {
             if tag.cs() != L1D_CS_INVALID {
-                let phys_addr = l1d_tag_to_phys(tag, (idx << self.dc.line_shift) as u64);
+                let phys_addr = l1d_tag_to_phys(tag, (idx << DCache::LINE_SHIFT) as u64);
                 println!("[CACHE DEBUG] invalidate_l1d_line: {} idx={}, phys_addr=0x{:08x}, ptag=0x{:06x}, cs={}, coherent={}",
                          self.tracking_label(phys_addr), idx, phys_addr, tag.ptag(), tag.cs(), coherent);
             } else {
@@ -902,8 +845,8 @@ impl R4000Cache {
         // Only clear llbit for software-initiated coherency invalidations, not hardware fills.
         // On a uniprocessor R4000 there are no external snoops; llbit survives capacity evictions.
         if coherent && tag.cs() != L1D_CS_INVALID {
-            let phys_addr = l1d_tag_to_phys(tag, (idx << self.dc.line_shift) as u64);
-            self.check_and_clear_llbit(phys_addr, self.dc.line_mask);
+            let phys_addr = l1d_tag_to_phys(tag, (idx << DCache::LINE_SHIFT) as u64);
+            self.check_and_clear_llbit(phys_addr, DCache::LINE_MASK);
         }
 
         self.dc.set_tag(idx, L1DTag::default());
@@ -917,7 +860,7 @@ impl R4000Cache {
         #[cfg(feature = "debug_cache")]
         if self.is_tracking_l2_idx(idx) {
             if l2_tag.cs() != L2_CS_INVALID {
-                let phys_base = l2_tag_to_phys(l2_tag, (idx << self.l2.line_shift) as u64);
+                let phys_base = l2_tag_to_phys(l2_tag, (idx << L2Cache::LINE_SHIFT) as u64);
                 println!("[CACHE DEBUG] invalidate_l2_line: {} idx={}, phys_base=0x{:08x}, ptag=0x{:05x}, cs={}",
                          self.tracking_label_l2_idx(idx), idx, phys_base, l2_tag.ptag(), l2_tag.cs());
             } else {
@@ -933,7 +876,7 @@ impl R4000Cache {
         }
 
         // Reconstruct physical address range covered by this L2 line
-        let phys_base = l2_tag_to_phys(l2_tag, (idx << self.l2.line_shift) as u64);
+        let phys_base = l2_tag_to_phys(l2_tag, (idx << L2Cache::LINE_SHIFT) as u64);
 
         // NOTE: do NOT clear llbit here. On R4000, llbit tracks L1-D state only.
         // An L2 eviction is not a coherency action and must not break LL/SC.
@@ -941,11 +884,11 @@ impl R4000Cache {
         // Check L1-I for any lines from this L2 line.
         // L1-I is VIPT so we must reconstruct the virtual index from pidx + physical sub-bits.
         let pidx = l2_tag.pidx();
-        let l1i_lines_per_l2 = 1 << (self.l2.line_shift - self.ic.line_shift);
+        let l1i_lines_per_l2 = 1 << (L2Cache::LINE_SHIFT - ICache::LINE_SHIFT);
         let ic_base_idx = self.l2_idx_to_l1_base_idx(idx, pidx, &self.ic);
         for i in 0..l1i_lines_per_l2 {
-            let ic_idx = (ic_base_idx + i) & self.ic.num_lines_mask;
-            let phys_addr = phys_base + ((i as u64) << self.ic.line_shift);
+            let ic_idx = (ic_base_idx + i) & ICache::NUM_LINES_MASK;
+            let phys_addr = phys_base + ((i as u64) << ICache::LINE_SHIFT);
             let ic_tag: L1ITag = self.ic.get_tag(ic_idx);
             if ic_tag.valid() && ic_tag.ptag() == self.l1_ptag(phys_addr) {
                 self.invalidate_l1i_line(ic_idx);
@@ -954,11 +897,11 @@ impl R4000Cache {
 
         // Check L1-D for any lines from this L2 line.
         // L1-D is VIPT so we must reconstruct the virtual index from pidx + physical sub-bits.
-        let l1d_lines_per_l2 = 1 << (self.l2.line_shift - self.dc.line_shift);
+        let l1d_lines_per_l2 = 1 << (L2Cache::LINE_SHIFT - DCache::LINE_SHIFT);
         let dc_base_idx = self.l2_idx_to_l1_base_idx(idx, pidx, &self.dc);
         for i in 0..l1d_lines_per_l2 {
-            let dc_idx = (dc_base_idx + i) & self.dc.num_lines_mask;
-            let phys_addr = phys_base + ((i as u64) << self.dc.line_shift);
+            let dc_idx = (dc_base_idx + i) & DCache::NUM_LINES_MASK;
+            let phys_addr = phys_base + ((i as u64) << DCache::LINE_SHIFT);
             let dc_tag: L1DTag = self.dc.get_tag(dc_idx);
 
             if dc_tag.cs() != L1D_CS_INVALID && dc_tag.ptag() == self.l1_ptag(phys_addr) {
@@ -982,7 +925,7 @@ impl R4000Cache {
         }
 
         // Reconstruct physical address from tag
-        let phys_addr = l1d_tag_to_phys(tag, (l1_idx << self.dc.line_shift) as u64);
+        let phys_addr = l1d_tag_to_phys(tag, (l1_idx << DCache::LINE_SHIFT) as u64);
 
         #[cfg(feature = "debug_cache")]
         if self.is_tracking_l1d(phys_addr) {
@@ -1005,21 +948,21 @@ impl R4000Cache {
         let dc_data = self.dc.data.get();
         let l2_data = self.l2.data.get_mut();
 
-        let l1_start_chunk = l1_idx << self.dc.chunks_per_line_shift;
+        let l1_start_chunk = l1_idx << DCache::CHUNKS_PER_LINE_SHIFT;
 
         // Calculate where in the L2 line this data goes
         // L2 lines are typically larger than L1 lines
-        let l2_line_base = l2_idx << self.l2.chunks_per_line_shift;
-        let offset_in_l2_line = ((phys_addr & self.l2.line_mask as u64) >> 3) as usize;
+        let l2_line_base = l2_idx << L2Cache::CHUNKS_PER_LINE_SHIFT;
+        let offset_in_l2_line = ((phys_addr & L2Cache::LINE_MASK as u64) >> 3) as usize;
 
-        for i in 0..self.dc.chunks_per_line {
+        for i in 0..DCache::CHUNKS_PER_LINE {
             l2_data[l2_line_base + offset_in_l2_line + i] = dc_data[l1_start_chunk + i];
         }
 
         // Sync l2.instrs for the updated region — read from dc_data (same values just written)
         let l2_instrs = self.l2.instrs.get_mut();
-        let instrs_start = (l2_idx << self.l2.instr_shift) + offset_in_l2_line * 2;
-        for i in 0..self.dc.chunks_per_line {
+        let instrs_start = (l2_idx << L2Cache::INSTR_SHIFT) + offset_in_l2_line * 2;
+        for i in 0..DCache::CHUNKS_PER_LINE {
             let chunk = dc_data[l1_start_chunk + i];
             let r0 = (chunk >> 32) as u32;
             let r1 = chunk as u32;
@@ -1055,15 +998,15 @@ impl R4000Cache {
         let tag: L2Tag = self.l2.get_tag(idx);
 
         // Reconstruct physical address from tag
-        let phys_addr = l2_tag_to_phys(tag, (idx << self.l2.line_shift) as u64);
+        let phys_addr = l2_tag_to_phys(tag, (idx << L2Cache::LINE_SHIFT) as u64);
 
         // First, writeback any dirty L1-D lines that are part of this L2 line.
         // L1-D is VIPT: reconstruct the virtual index using pidx from the L2 tag.
-        let l1d_lines_per_l2 = 1 << (self.l2.line_shift - self.dc.line_shift);
+        let l1d_lines_per_l2 = 1 << (L2Cache::LINE_SHIFT - DCache::LINE_SHIFT);
         let dc_base_idx = self.l2_idx_to_l1_base_idx(idx, tag.pidx(), &self.dc);
         for i in 0..l1d_lines_per_l2 {
-            let dc_idx = (dc_base_idx + i) & self.dc.num_lines_mask;
-            let phys_addr_l1 = phys_addr + ((i as u64) << self.dc.line_shift);
+            let dc_idx = (dc_base_idx + i) & DCache::NUM_LINES_MASK;
+            let phys_addr_l1 = phys_addr + ((i as u64) << DCache::LINE_SHIFT);
             let dc_tag: L1DTag = self.dc.get_tag(dc_idx);
 
             // Check if this L1-D line matches and is dirty
@@ -1085,9 +1028,9 @@ impl R4000Cache {
                      self.tracking_label_l2_idx(idx), idx, phys_addr, tag.ptag(), cs);
             // Dump the L2 line data being written
             let l2_data = self.l2.data.get();
-            let start_chunk = idx << self.l2.chunks_per_line_shift;
+            let start_chunk = idx << L2Cache::CHUNKS_PER_LINE_SHIFT;
             println!("  L2 line data being written (16 x u64):");
-            for i in 0..self.l2.chunks_per_line {
+            for i in 0..L2Cache::CHUNKS_PER_LINE {
                 let val = l2_data[start_chunk + i];
                 println!("    [{}] addr=0x{:08x} val=0x{:016x}", i, phys_addr + ((i as u64) << 3), val);
             }
@@ -1098,9 +1041,9 @@ impl R4000Cache {
 
         // Now write L2 data to memory
         let l2_data = self.l2.data.get();
-        let start_chunk = idx << self.l2.chunks_per_line_shift;
+        let start_chunk = idx << L2Cache::CHUNKS_PER_LINE_SHIFT;
 
-        for i in 0..self.l2.chunks_per_line {
+        for i in 0..L2Cache::CHUNKS_PER_LINE {
             let chunk_addr = phys_addr + ((i as u64) << 3);
             let val = l2_data[start_chunk + i];
 
@@ -1128,14 +1071,14 @@ impl R4000Cache {
         self.invalidate_l2_line(l2_idx);
 
         // Calculate line-aligned address
-        let line_base = phys_addr & !(self.l2.line_mask as u64);
+        let line_base = phys_addr & !(L2Cache::LINE_MASK as u64);
 
         // Fill line from memory
         let l2_data = self.l2.data.get_mut();
-        let start_chunk = l2_idx << self.l2.chunks_per_line_shift;
+        let start_chunk = l2_idx << L2Cache::CHUNKS_PER_LINE_SHIFT;
 
-        let instrs_start = l2_idx << self.l2.instr_shift;
-        for i in 0..self.l2.chunks_per_line {
+        let instrs_start = l2_idx << L2Cache::INSTR_SHIFT;
+        for i in 0..L2Cache::CHUNKS_PER_LINE {
             let fetch_addr = line_base + ((i as u64) << 3);
             let r = self.downstream.read64(fetch_addr as u32);
             if !r.is_ok() { return false; }
@@ -1169,7 +1112,7 @@ impl R4000Cache {
             println!("[CACHE DEBUG] fill_l2_line: {} line 0x{:08x}, idx={}, phys_addr=0x{:08x}, ptag=0x{:05x}, pidx={}",
                      self.tracking_label_l2_idx(l2_idx), line_base, l2_idx, phys_addr, ptag, pidx);
             println!("  L2 line data (16 x u64):");
-            for i in 0..self.l2.chunks_per_line {
+            for i in 0..L2Cache::CHUNKS_PER_LINE {
                 let val = l2_data[start_chunk + i];
                 println!("    [{}] 0x{:016x}", i, val);
             }
@@ -1217,12 +1160,12 @@ impl R4000Cache {
         // Store l2.instrs slot indices into ic.data (two u32 per u64, high=even, low=odd)
         // Align to L1I line boundary before computing L2 word offset — phys_addr may
         // point to any word within the line, not necessarily the first.
-        let ic_line_base = phys_addr & !(self.ic.line_mask as u64);
-        let l2_word_offset = ((ic_line_base as usize) & self.l2.line_mask) >> 2;
-        let l2_instrs_base = (l2_idx << self.l2.instr_shift) + l2_word_offset;
+        let ic_line_base = phys_addr & !(ICache::LINE_MASK as u64);
+        let l2_word_offset = ((ic_line_base as usize) & L2Cache::LINE_MASK) >> 2;
+        let l2_instrs_base = (l2_idx << L2Cache::INSTR_SHIFT) + l2_word_offset;
         let ic_data = self.ic.data.get_mut();
-        let ic_data_base = ic_idx * self.ic.chunks_per_line;
-        for i in 0..self.ic.chunks_per_line {
+        let ic_data_base = ic_idx * ICache::CHUNKS_PER_LINE;
+        for i in 0..ICache::CHUNKS_PER_LINE {
             let idx0 = (l2_instrs_base + i * 2    ) as u32;
             let idx1 = (l2_instrs_base + i * 2 + 1) as u32;
             ic_data[ic_data_base + i] = ((idx0 as u64) << 32) | (idx1 as u64);
@@ -1272,15 +1215,15 @@ impl R4000Cache {
 
         // Now copy from L2 to L1-D
         // Align phys_addr to L1-D cache line boundary first
-        let dc_line_base = phys_addr & !(self.dc.line_mask as u64);
-        let l2_line_base = l2_idx << self.l2.chunks_per_line_shift;
-        let offset_in_l2_line = ((dc_line_base & (self.l2.line_mask as u64)) >> 3) as usize;
+        let dc_line_base = phys_addr & !(DCache::LINE_MASK as u64);
+        let l2_line_base = l2_idx << L2Cache::CHUNKS_PER_LINE_SHIFT;
+        let offset_in_l2_line = ((dc_line_base & (L2Cache::LINE_MASK as u64)) >> 3) as usize;
 
         let l2_data = self.l2.data.get();
         let dc_data = self.dc.data.get_mut();
-        let dc_start_chunk = dc_idx << self.dc.chunks_per_line_shift;
+        let dc_start_chunk = dc_idx << DCache::CHUNKS_PER_LINE_SHIFT;
 
-        for i in 0..self.dc.chunks_per_line {
+        for i in 0..DCache::CHUNKS_PER_LINE {
             dc_data[dc_start_chunk + i] = l2_data[l2_line_base + offset_in_l2_line + i];
         }
 
@@ -1295,13 +1238,13 @@ impl R4000Cache {
 
         #[cfg(feature = "debug_cache")]
         {
-            let line_base_phys = phys_addr & !(self.dc.line_mask as u64);
+            let line_base_phys = phys_addr & !(DCache::LINE_MASK as u64);
             if self.is_tracking_l1d(line_base_phys) {
-                let line_base_virt = virt_addr & !(self.dc.line_mask as u64);
+                let line_base_virt = virt_addr & !(DCache::LINE_MASK as u64);
                 println!("[CACHE DEBUG] fill_l1d_line: {} line virt 0x{:016x}, phys 0x{:08x}, idx={}, ptag=0x{:06x}",
                          self.tracking_label(line_base_phys), line_base_virt, line_base_phys, dc_idx, ptag);
                 println!("  L1-D line data (4 x u64):");
-                for i in 0..self.dc.chunks_per_line {
+                for i in 0..DCache::CHUNKS_PER_LINE {
                     let val = dc_data[dc_start_chunk + i];
                     println!("    [{}] 0x{:016x}", i, val);
                 }
@@ -1323,7 +1266,7 @@ impl MipsCache for R4000Cache {
                 // Also track fetches that will hit the same L2 index (cache line aliasing)
                 let l2_idx = self.l2.get_index(phys_addr);
                 if self.is_tracking_l2_idx(l2_idx) {
-                    let line_base = phys_addr & !(self.l2.line_mask as u64);
+                    let line_base = phys_addr & !(L2Cache::LINE_MASK as u64);
                     println!("[CACHE DEBUG] fetch (L2 alias): idx={}, line 0x{:08x}, virt 0x{:016x}, phys 0x{:016x}",
                              l2_idx, line_base, virt_addr, phys_addr);
                 }
@@ -1349,9 +1292,9 @@ impl MipsCache for R4000Cache {
         // Return pointer to the DecodedInstr slot in l2.instrs.
         // ic.data_as_words() gives a flat &[u32] view; XOR word index with 1 accounts
         // for the big-endian packing ((idx0<<32)|idx1) on a little-endian host.
-        let word_offset = ((phys_addr as usize) & self.ic.line_mask) >> 2;
+        let word_offset = ((phys_addr as usize) & ICache::LINE_MASK) >> 2;
         let l2_slot_idx = self.ic.data_as_words()
-            [((ic_idx << self.ic.instr_shift) + word_offset) ^ 1] as usize;
+            [((ic_idx << ICache::INSTR_SHIFT) + word_offset) ^ 1] as usize;
         let slot = &self.l2.instrs.get()[l2_slot_idx] as *const DecodedInstr;
         FetchInstrResult::hit(slot)
     }
@@ -1366,7 +1309,7 @@ impl MipsCache for R4000Cache {
                 // Also track reads that will hit the same L2 index (cache line aliasing)
                 let l2_idx = self.l2.get_index(phys_addr);
                 if self.is_tracking_l2_idx(l2_idx) {
-                    let line_base = phys_addr & !(self.l2.line_mask as u64);
+                    let line_base = phys_addr & !(L2Cache::LINE_MASK as u64);
                     println!("[CACHE DEBUG] read (L2 alias): idx={}, line 0x{:08x}, virt 0x{:016x}, phys 0x{:016x}, size {}",
                              l2_idx, line_base, virt_addr, phys_addr, size);
                 }
@@ -1406,7 +1349,7 @@ impl MipsCache for R4000Cache {
                 // Also track writes that will hit the same L2 index (cache line aliasing)
                 let l2_idx = self.l2.get_index(phys_addr);
                 if self.is_tracking_l2_idx(l2_idx) {
-                    let line_base = phys_addr & !(self.l2.line_mask as u64);
+                    let line_base = phys_addr & !(L2Cache::LINE_MASK as u64);
                     println!("[CACHE DEBUG] write64_masked (L2 alias): idx={}, line 0x{:08x}, virt 0x{:016x}, phys 0x{:016x}, val 0x{:016x}",
                              l2_idx, line_base, virt_addr, phys_addr, val);
                 }
@@ -1447,15 +1390,21 @@ impl MipsCache for R4000Cache {
         let operation = cache_op & 0x1C;     // bits [20:18] (shifted by 2)
 
         #[allow(unreachable_patterns)]
-        let (cache, is_icache, is_l2) = match cache_target {
-            CACH_PI => (&self.ic, true, false),
-            CACH_PD => (&self.dc, false, false),
-            CACH_SI | CACH_SD => (&self.l2, false, true),
+        let (is_icache, is_l2) = match cache_target {
+            CACH_PI => (true, false),
+            CACH_PD => (false, false),
+            CACH_SI | CACH_SD => (false, true),
             _ => return 0,
         };
 
         // L1I and L1D are virtually indexed; L2 is physically indexed
-        let idx = if is_l2 { cache.get_index(phys_addr) } else { cache.get_index(virt_addr) };
+        let idx = if is_l2 {
+            self.l2.get_index(phys_addr)
+        } else if is_icache {
+            self.ic.get_index(virt_addr)
+        } else {
+            self.dc.get_index(virt_addr)
+        };
 
         match operation {
             // Index Invalidate (I, SI) or Index Writeback Invalidate (D, SD)
@@ -1682,9 +1631,9 @@ impl MipsCache for R4000Cache {
 
     fn get_config(&self, cache_target: u32) -> (usize, usize) {
         match cache_target {
-            CACH_PI => (self.ic.cache_size, self.ic.line_size),
-            CACH_PD => (self.dc.cache_size, self.dc.line_size),
-            CACH_SI | CACH_SD => (self.l2.cache_size, self.l2.line_size),
+            CACH_PI => (IC_SIZE, IC_LINE),
+            CACH_PD => (DC_SIZE, DC_LINE),
+            CACH_SI | CACH_SD => (L2_SIZE, L2_LINE),
             _ => (0, 16),
         }
     }
@@ -1698,8 +1647,8 @@ impl MipsCache for R4000Cache {
             return;
         }
         let ll_addr = (self.get_lladdr() as u64) << 4;
-        let addr_line = phys_addr & !(self.dc.line_mask as u64);
-        let ll_line = ll_addr & !(self.dc.line_mask as u64);
+        let addr_line = phys_addr & !(DCache::LINE_MASK as u64);
+        let ll_line = ll_addr & !(DCache::LINE_MASK as u64);
         if addr_line == ll_line {
             self.set_llbit(false);
         }
@@ -1780,18 +1729,18 @@ impl MipsCache for R4000Cache {
     fn debug_dump_line(&self, cache_name: &str, idx: usize) -> String {
         match cache_name {
             "l1i" => {
-                if idx >= self.ic.num_lines {
-                    return format!("Index 0x{:x} out of bounds (max 0x{:x})", idx, self.ic.num_lines - 1);
+                if idx >= ICache::NUM_LINES {
+                    return format!("Index 0x{:x} out of bounds (max 0x{:x})", idx, ICache::NUM_LINES - 1);
                 }
                 let tag: L1ITag = self.ic.get_tag(idx);
 
                 // Decoded slots live in L2 — look up via ic.data indices.
-                let instrs_per_ic_line = self.ic.instrs_per_line;
+                let instrs_per_ic_line = ICache::INSTRS_PER_LINE;
                 let ic_instrs = self.l2.instrs.get();
 
                 let mut s = format!("L1-I Line 0x{:x}: Tag=0x{:06x} V={}\n  Instrs:", idx, tag.ptag(), tag.valid());
                 let ic_data_words = self.ic.data_as_words();
-                let ic_instrs_base = idx << self.ic.instr_shift;
+                let ic_instrs_base = idx << ICache::INSTR_SHIFT;
                 for i in 0..instrs_per_ic_line {
                     if i % 4 == 0 { s.push_str("\n    "); }
                     let l2_slot_idx = ic_data_words[(ic_instrs_base + i) ^ 1] as usize;
@@ -1802,8 +1751,8 @@ impl MipsCache for R4000Cache {
                 s
             }
             "l1d" => {
-                if idx >= self.dc.num_lines {
-                    return format!("Index 0x{:x} out of bounds (max 0x{:x})", idx, self.dc.num_lines - 1);
+                if idx >= DCache::NUM_LINES {
+                    return format!("Index 0x{:x} out of bounds (max 0x{:x})", idx, DCache::NUM_LINES - 1);
                 }
                 let tag: L1DTag = self.dc.get_tag(idx);
                 let cs_str = match tag.cs() {
@@ -1815,11 +1764,11 @@ impl MipsCache for R4000Cache {
                 };
 
                 let dc_data = self.dc.data.get();
-                let start = idx << self.dc.chunks_per_line_shift;
+                let start = idx << DCache::CHUNKS_PER_LINE_SHIFT;
 
                 let mut s = format!("L1-D Line 0x{:x}: Tag=0x{:06x} CS={} ({}) D={}\n  Data:",
                     idx, tag.ptag(), tag.cs(), cs_str, tag.dirty());
-                for i in 0..self.dc.chunks_per_line {
+                for i in 0..DCache::CHUNKS_PER_LINE {
                     if i % 4 == 0 { s.push_str("\n    "); }
                     if start + i < dc_data.len() {
                         s.push_str(&format!("{:016x} ", dc_data[start + i]));
@@ -1828,8 +1777,8 @@ impl MipsCache for R4000Cache {
                 s
             }
             "l2" => {
-                if idx >= self.l2.num_lines {
-                    return format!("Index 0x{:x} out of bounds (max 0x{:x})", idx, self.l2.num_lines - 1);
+                if idx >= L2Cache::NUM_LINES {
+                    return format!("Index 0x{:x} out of bounds (max 0x{:x})", idx, L2Cache::NUM_LINES - 1);
                 }
                 let tag: L2Tag = self.l2.get_tag(idx);
                 let cs_str = match tag.cs() {
@@ -1842,11 +1791,11 @@ impl MipsCache for R4000Cache {
                 };
 
                 let l2_data = self.l2.data.get();
-                let start = idx << self.l2.chunks_per_line_shift;
+                let start = idx << L2Cache::CHUNKS_PER_LINE_SHIFT;
 
                 let mut s = format!("L2 Line 0x{:x}: Tag=0x{:05x} CS={} ({})\n  Data:",
                     idx, tag.ptag(), tag.cs(), cs_str);
-                for i in 0..self.l2.chunks_per_line {
+                for i in 0..L2Cache::CHUNKS_PER_LINE {
                     if i % 4 == 0 { s.push_str("\n    "); }
                     if start + i < l2_data.len() {
                         s.push_str(&format!("{:016x} ", l2_data[start + i]));
@@ -1916,11 +1865,11 @@ impl Resettable for R4000Cache {
 // ---- snapshot helpers + MipsCache save/load override ----
 
 impl R4000Cache {
-    fn save_cache_inner(c: &Cache) -> (Vec<u32>, Vec<u64>) {
+    fn save_cache_inner<const S: usize, const L: usize, const K: u8>(c: &Cache<S, L, K>) -> (Vec<u32>, Vec<u64>) {
         (c.tags.get().clone(), c.data.get().clone())
     }
 
-    fn load_cache_inner(c: &Cache, tags: &[u32], data: &[u64]) {
+    fn load_cache_inner<const S: usize, const L: usize, const K: u8>(c: &Cache<S, L, K>, tags: &[u32], data: &[u64]) {
         let t = c.tags.get_mut();
         let tl = tags.len().min(t.len());
         t[..tl].copy_from_slice(&tags[..tl]);
@@ -1949,12 +1898,12 @@ impl R4000Cache {
     }
 
     pub fn load_cache_state(&self, v: &toml::Value) -> Result<(), String> {
-        let mut ic_tags = vec![0u32; self.ic.num_lines];
-        let mut ic_data = vec![0u64; self.ic.cache_size / 8];
-        let mut dc_tags = vec![0u32; self.dc.num_lines];
-        let mut dc_data = vec![0u64; self.dc.cache_size / 8];
-        let mut l2_tags = vec![0u32; self.l2.num_lines];
-        let mut l2_data = vec![0u64; self.l2.cache_size / 8];
+        let mut ic_tags = vec![0u32; ICache::NUM_LINES];
+        let mut ic_data = vec![0u64; IC_SIZE / 8];
+        let mut dc_tags = vec![0u32; DCache::NUM_LINES];
+        let mut dc_data = vec![0u64; DC_SIZE / 8];
+        let mut l2_tags = vec![0u32; L2Cache::NUM_LINES];
+        let mut l2_data = vec![0u64; L2_SIZE / 8];
 
         if let Some(f) = get_field(v, "ic_tags") { load_u32_slice(f, &mut ic_tags); }
         if let Some(f) = get_field(v, "ic_data") { load_u64_slice(f, &mut ic_data); }
@@ -1972,10 +1921,10 @@ impl R4000Cache {
         {
             let l2_data_slice: Vec<u64> = self.l2.data.get().clone();
             let l2_instrs = self.l2.instrs.get_mut();
-            for line in 0..self.l2.num_lines {
-                let chunks_start = line << self.l2.chunks_per_line_shift;
-                let instrs_start = line << self.l2.instr_shift;
-                for i in 0..self.l2.chunks_per_line {
+            for line in 0..L2Cache::NUM_LINES {
+                let chunks_start = line << L2Cache::CHUNKS_PER_LINE_SHIFT;
+                let instrs_start = line << L2Cache::INSTR_SHIFT;
+                for i in 0..L2Cache::CHUNKS_PER_LINE {
                     let chunk = l2_data_slice[chunks_start + i];
                     l2_instrs[instrs_start + i * 2].raw = (chunk >> 32) as u32;
                     l2_instrs[instrs_start + i * 2].decoded = false;

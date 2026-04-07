@@ -513,27 +513,13 @@ impl TranslateResult {
 #[derive(Debug, Clone, Copy)]
 pub struct MipsCpuConfig {
     pub tlb_entries: usize,
-    pub ic_size: usize,     // L1 instruction cache size in bytes
-    pub ic_line: usize,     // L1 instruction cache line size in bytes
-    pub dc_size: usize,     // L1 data cache size in bytes
-    pub dc_line: usize,     // L1 data cache line size in bytes
-    pub l2_size: usize,     // L2 cache size in bytes
-    pub l2_line: usize,     // L2 cache line size in bytes
 }
 
 impl MipsCpuConfig {
-    /// Default configuration matching SGI Indy (R4600): 48-entry TLB,
-    /// 16KB/32B L1 I/D caches, 1MB/128B unified L2.
+    /// Default configuration matching SGI Indy (R4400): 48-entry TLB.
+    /// Cache geometry is fixed at compile time via constants in mips_cache_v2.
     pub const fn indy() -> Self {
-        Self {
-            tlb_entries: 48,
-            ic_size:     16 * 1024,
-            ic_line:     16,
-            dc_size:     16 * 1024,
-            dc_line:     16,
-            l2_size:     1024 * 1024,
-            l2_line:     128,
-        }
+        Self { tlb_entries: 48 }
     }
 }
 
@@ -630,61 +616,47 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
     /// The cache hierarchy is constructed internally as a unified R4000Cache.
     pub fn new(sysad: Arc<dyn BusDevice>, tlb: T, cfg: &MipsCpuConfig) -> Self
     where
-        C: From<(Arc<dyn BusDevice>, R4000CacheConfig)>
+        C: From<Arc<dyn BusDevice>>
     {
         let mut core = MipsCore::new();
 
-        let MipsCpuConfig { ic_size, ic_line, dc_size, dc_line, l2_size, l2_line, .. } = *cfg;
+        // Build unified cache hierarchy. Cache geometry is fixed at compile time;
+        // IC_SIZE/IC_LINE/DC_SIZE/DC_LINE/L2_SIZE/L2_LINE are consts from mips_cache_v2.
+        let cache = C::from(sysad.clone());
 
-        // Build unified cache hierarchy
-        let cache_config = R4000CacheConfig {
-            ic_size,
-            ic_line_size: ic_line,
-            dc_size,
-            dc_line_size: dc_line,
-            l2_size,
-            l2_line_size: l2_line,
-        };
-        let cache = C::from((sysad.clone(), cache_config));
-        
-        let mut config = 0;
+        // Build CP0 Config register from architecture constants.
+        let mut config = 0u32;
 
         // K0 (bits 2:0): kseg0 coherency algorithm. 3 = Cacheable, non-coherent.
         config |= 3 << CONFIG_K0;
 
         // DB (bit 4): Primary D-cache line size. 0=16B, 1=32B.
-        let db_val = if dc_line >= 32 { 1 } else { 0 };
-        config |= db_val << CONFIG_DB;
+        config |= (if DC_LINE >= 32 { 1 } else { 0 }) << CONFIG_DB;
 
         // IB (bit 5): Primary I-cache line size. 0=16B, 1=32B.
-        let ib_val = if ic_line >= 32 { 1 } else { 0 };
-        config |= ib_val << CONFIG_IB;
+        config |= (if IC_LINE >= 32 { 1 } else { 0 }) << CONFIG_IB;
 
         // DC (bits 8:6): Primary D-cache size. size = 2^(12+DC)
-        let dc_val = if dc_size > 0 { (dc_size.trailing_zeros()).saturating_sub(12) } else { 0 };
-        config |= dc_val << CONFIG_DC;
+        config |= DC_SIZE.trailing_zeros().saturating_sub(12) << CONFIG_DC;
 
         // IC (bits 11:9): Primary I-cache size. size = 2^(12+IC)
-        let ic_val = if ic_size > 0 { (ic_size.trailing_zeros()).saturating_sub(12) } else { 0 };
-        config |= ic_val << CONFIG_IC;
+        config |= IC_SIZE.trailing_zeros().saturating_sub(12) << CONFIG_IC;
 
         // BE (bit 15): Big Endian. 1 for Indy.
         config |= 1 << CONFIG_BE;
 
         // SC (bit 17): Secondary cache present. 0=present, 1=absent.
-        let sc_val = if l2_size > 0 { 0 } else { 1 };
-        config |= sc_val << CONFIG_SC;
+        config |= (if L2_SIZE > 0 { 0 } else { 1 }) << CONFIG_SC;
 
         // SB (bits 23:22): Secondary cache block size.
         // 00=4 words (16B), 01=8 words (32B), 10=16 words (64B), 11=32 words (128B).
-        let sb_val = match l2_line {
-            16 => 0b00,
-            32 => 0b01,
-            64 => 0b10,
+        config |= (match L2_LINE {
+            16  => 0b00,
+            32  => 0b01,
+            64  => 0b10,
             128 => 0b11,
-            _ => 0b11, // Default to 128B for our 1MB cache
-        };
-        config |= sb_val << CONFIG_SB;
+            _   => 0b11,
+        }) << CONFIG_SB;
 /*
 For R4000SC/MC CPUs:
 
