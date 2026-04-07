@@ -3552,7 +3552,7 @@ impl Device for Rex3 {
 
     fn register_commands(&self) -> Vec<(String, String)> {
         vec![
-            ("rex".to_string(), "REX3 commands: rex status | rex debug <on|off> [DEV] | rex cmap <on|off> | rex buslog <on|off> (logs to rex3.log) [DEV]".to_string()),
+            ("rex".to_string(), "REX3 commands: rex status (includes JIT stats) | rex debug <on|off> [DEV] | rex cmap <on|off> | rex buslog <on|off> (logs to rex3.log) [DEV]".to_string()),
             ("dcb".to_string(), "DCB commands: dcb debug <on|off> [DEV]".to_string()),
             ("vc2".to_string(), "VC2 commands: vc2 status | vc2 debug <on|off> [DEV]".to_string()),
             ("block".to_string(), "Block draw logging: block debug <on|off> [DEV]".to_string()),
@@ -3616,6 +3616,28 @@ impl Device for Rex3 {
             writeln!(writer, "DRAW BUSY : {}  GFIFO : {}/{} entries used",
                 if gfxbusy { "YES" } else { "no" },
                 gfifo_pending, GFIFO_DEPTH).unwrap();
+            #[cfg(feature = "rex-jit")]
+            {
+                if let Some(ref jit) = self.rex_jit {
+                    let pairs = jit.compiled_pairs();
+                    writeln!(writer, "--- JIT ---").unwrap();
+                    writeln!(writer, "Compiled  : {}  Queued : {}",
+                        pairs.len(), jit.queued_count()).unwrap();
+                    if pairs.is_empty() {
+                        writeln!(writer, "(no compiled shaders yet)").unwrap();
+                    } else {
+                        for (dm0, dm1) in &pairs {
+                            writeln!(writer, "  dm0={:#010x}  dm1={:#010x}  {}  {}",
+                                dm0, dm1,
+                                decode_dm0(*dm0), decode_dm1(*dm1)).unwrap();
+                        }
+                    }
+                } else {
+                    writeln!(writer, "--- JIT : disabled (rex_jit not initialised) ---").unwrap();
+                }
+            }
+            #[cfg(not(feature = "rex-jit"))]
+            writeln!(writer, "--- JIT : not compiled in (build without --features rex-jit) ---").unwrap();
             return Ok(());
         }
 

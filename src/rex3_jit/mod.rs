@@ -179,6 +179,18 @@ impl RexJit {
     pub fn compiled_count(&self) -> usize {
         self.store.cache.read().unwrap().len()
     }
+
+    /// Return the number of shaders currently queued for compilation.
+    pub fn queued_count(&self) -> usize {
+        self.store.queued.read().unwrap().len()
+    }
+
+    /// Return a sorted list of all compiled (dm0, dm1) pairs.
+    pub fn compiled_pairs(&self) -> Vec<(u32, u32)> {
+        let mut pairs: Vec<(u32, u32)> = self.store.cache.read().unwrap().keys().copied().collect();
+        pairs.sort();
+        pairs
+    }
 }
 
 impl Drop for RexJit {
