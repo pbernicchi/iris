@@ -939,22 +939,21 @@ For R4000SC/MC CPUs:
             }
         }
 
-        let result = match self.fetch_instr(pc) {
-            Ok(d) => {
-                let slot = d as *mut DecodedInstr;
-                if decode_into::<T, C>(unsafe { &mut *slot }) {
-                    #[cfg(feature = "developer")]
-                    self.decoded_count.fetch_add(1, Ordering::Relaxed);
-                }
-                let d = unsafe { &*slot };
-                #[cfg(not(feature = "lightning"))]
-                self.traceback.push(pc, d.raw);
-                self.exec_decoded(d)
+        let fetch = self.fetch_instr(pc);
+        let result = if fetch.status == EXEC_COMPLETE {
+            let slot = fetch.instr as *mut DecodedInstr;
+            if decode_into::<T, C>(unsafe { &mut *slot }) {
+                #[cfg(feature = "developer")]
+                self.decoded_count.fetch_add(1, Ordering::Relaxed);
             }
-            Err(s) if s & EXEC_IS_EXCEPTION != 0 => {
-                self.handle_exception(s)
-            }
-            Err(s) => s,
+            let d = unsafe { &*slot };
+            #[cfg(not(feature = "lightning"))]
+            self.traceback.push(pc, d.raw);
+            self.exec_decoded(d)
+        } else if fetch.status & EXEC_IS_EXCEPTION != 0 {
+            self.handle_exception(fetch.status)
+        } else {
+            fetch.status
         };
         self.skip_breakpoints = false;
         result
@@ -1453,28 +1452,33 @@ For R4000SC/MC CPUs:
     /// Fetch instruction: translates virtual address and reads from I-cache
     /// Fetch and decode the instruction at virt_addr.
     /// Returns a pointer to the DecodedInstr (in cache or self.ins scratch) on success,
-    /// or an error ExecStatus on fault/breakpoint.
-    fn fetch_instr(&mut self, virt_addr: u64) -> Result<*const DecodedInstr, ExecStatus> {
+    /// Fetch instruction, returning `FetchInstrResult`.
+    /// `status == EXEC_COMPLETE` means hit; `instr` is valid. Any other status is an error.
+    fn fetch_instr(&mut self, virt_addr: u64) -> FetchInstrResult {
         self.fetch_instr_impl::<false>(virt_addr)
     }
 
     /// Debug instruction fetch: kernel-mode override, no breakpoints, no CP0 side-effects.
     /// Returns the raw instruction word only (no decode).
     pub fn debug_fetch_instr(&mut self, virt_addr: u64) -> Result<u32, ExecStatus> {
-        self.fetch_instr_impl::<true>(virt_addr)
-            .map(|slot| unsafe { (*slot).raw })
+        let r = self.fetch_instr_impl::<true>(virt_addr);
+        if r.status == EXEC_COMPLETE {
+            Ok(unsafe { (*r.instr).raw })
+        } else {
+            Err(r.status)
+        }
     }
 
     /// Core instruction fetch.  When `DEBUG=true`:
     /// - Privilege is treated as Kernel (via translate_impl)
     /// - Breakpoint checks are skipped
     /// - cp0_badvaddr is never written
-    /// Returns a pointer to the DecodedInstr slot (cache or scratch).
+    /// Returns `FetchInstrResult`; `status == EXEC_COMPLETE` means hit, `instr` is valid.
     #[inline]
-    fn fetch_instr_impl<const DEBUG: bool>(&mut self, virt_addr: u64) -> Result<*const DecodedInstr, ExecStatus> {
+    fn fetch_instr_impl<const DEBUG: bool>(&mut self, virt_addr: u64) -> FetchInstrResult {
         #[cfg(not(feature = "lightning"))]
         if !DEBUG && self.bp_enabled() && self.check_breakpoint::<{ BpType::VirtFetch as u8 }>(virt_addr) {
-            return Err(EXEC_BREAKPOINT);
+            return FetchInstrResult::exception(EXEC_BREAKPOINT);
         }
 
         let translate_result = if DEBUG {
@@ -1482,27 +1486,23 @@ For R4000SC/MC CPUs:
         } else {
             self.nanotlb_translate::<{AccessType::Fetch as u8}>(virt_addr)
         };
-        if translate_result.is_exception() { return Err(translate_result.status); }
+        if translate_result.is_exception() { return FetchInstrResult::exception(translate_result.status); }
         let phys_addr = translate_result.phys;
         if translate_result.is_cached() {
             #[cfg(not(feature = "lightning"))]
             if !DEBUG && self.bp_enabled() && self.check_breakpoint::<{ BpType::PhysFetch as u8 }>(phys_addr as u64) {
-                return Err(EXEC_BREAKPOINT);
+                return FetchInstrResult::exception(EXEC_BREAKPOINT);
             }
 
-            match self.cache.fetch(virt_addr, phys_addr as u64) {
-                FetchResult::Hit(slot) => Ok(slot),
-                FetchResult::Busy => Err(EXEC_RETRY),
-                FetchResult::VirtualCoherencyException => {
-                    if !DEBUG { self.core.cp0_badvaddr = virt_addr; }
-                    Err(exec_exception(EXC_VCEI))
-                }
-                FetchResult::Error => Err(exec_exception(EXC_IBE)),
+            let r = self.cache.fetch(virt_addr, phys_addr as u64);
+            if !DEBUG && r.status == exec_exception(EXC_VCEI) {
+                self.core.cp0_badvaddr = virt_addr;
             }
+            r
         } else {
             #[cfg(not(feature = "lightning"))]
             if !DEBUG && self.bp_enabled() && self.check_breakpoint::<{ BpType::PhysFetch as u8 }>(phys_addr as u64) {
-                return Err(EXEC_BREAKPOINT);
+                return FetchInstrResult::exception(EXEC_BREAKPOINT);
             }
 
             #[cfg(feature = "developer")]
@@ -1511,12 +1511,13 @@ For R4000SC/MC CPUs:
             if r.is_ok() {
                 if self.ins.raw != r.data { self.ins.decoded = false; }
                 self.ins.raw = r.data;
-                Ok(&self.ins as *const DecodedInstr)
-            } else if r.status == BUS_BUSY {
-                Err(EXEC_RETRY)
+                FetchInstrResult::hit(&self.ins as *const DecodedInstr)
             } else {
-                eprintln!("Bus error on instruction fetch: PC={:016x} PA={:08x} status={:08x}", virt_addr, phys_addr, r.status);
-                Err(exec_exception(EXC_IBE))
+                // BUS_BUSY == EXEC_RETRY (compile-time asserted in traits.rs); pass status through.
+                if r.status != BUS_BUSY {
+                    eprintln!("Bus error on instruction fetch: PC={:016x} PA={:08x} status={:08x}", virt_addr, phys_addr, r.status);
+                }
+                FetchInstrResult::exception(r.status)
             }
         }
     }

@@ -8,21 +8,31 @@
 
 use crate::traits::{BusRead64, BusDevice, Resettable, BUS_OK, BUS_BUSY, BUS_ERR, BUS_VCE};
 use crate::snapshot::{u32_slice_to_toml, u64_slice_to_toml, load_u32_slice, load_u64_slice, get_field, toml_bool, toml_u32, hex_u32};
-use crate::mips_exec::DecodedInstr;
+use crate::mips_exec::{DecodedInstr, ExecStatus, EXEC_COMPLETE, EXEC_RETRY, exec_exception_const, EXC_VCEI, EXC_IBE};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::cell::UnsafeCell;
 use bitfield::bitfield;
 
-/// Result of a fetch from the L1 instruction cache.
-/// On hit, returns a raw pointer to the DecodedInstr slot in the cache (or scratch buffer).
-/// The caller is responsible for calling decode_into on the slot before use.
-pub enum FetchResult {
-    /// Pointer to the DecodedInstr slot. Valid for the lifetime of the cache.
-    Hit(*const DecodedInstr),
-    VirtualCoherencyException,
-    Error,
-    Busy,
+/// Result of a cache instruction fetch, shared by `MipsCache::fetch` and `fetch_instr_impl`.
+/// `status == EXEC_COMPLETE` means hit; `instr` points to the DecodedInstr slot (valid for
+/// the lifetime of the cache). Any other status is an exception/retry; `instr` is null.
+pub struct FetchInstrResult {
+    pub status: ExecStatus,
+    pub instr: *const DecodedInstr,
+}
+
+unsafe impl Send for FetchInstrResult {}
+
+impl FetchInstrResult {
+    #[inline(always)]
+    pub fn hit(instr: *const DecodedInstr) -> Self {
+        Self { status: EXEC_COMPLETE, instr }
+    }
+    #[inline(always)]
+    pub fn exception(status: ExecStatus) -> Self {
+        Self { status, instr: std::ptr::null() }
+    }
 }
 
 /// Result of cache line fill operations
@@ -164,9 +174,9 @@ impl From<L2Tag> for u32  { fn from(t: L2Tag) -> Self { t.0 } }
 /// - Load-Linked / Store-Conditional support
 pub trait MipsCache: Send + Sync {
     /// Fetch instruction from L1 instruction cache.
-    /// Returns a pointer to the DecodedInstr slot (in cache or scratch).
-    /// The caller must call decode_into on the slot before use.
-    fn fetch(&self, virt_addr: u64, phys_addr: u64) -> FetchResult;
+    /// Returns `FetchInstrResult::hit(ptr)` on success, `FetchInstrResult::exception(status)` on error.
+    /// The caller must call `decode_into` on the slot before use.
+    fn fetch(&self, virt_addr: u64, phys_addr: u64) -> FetchInstrResult;
 
     /// Read data using virtual and physical addresses.
     /// Uses virtual address for index, physical address for tag (VIPT).
@@ -312,17 +322,16 @@ impl From<(Arc<dyn BusDevice>, R4000CacheConfig)> for PassthroughCache {
 }
 
 impl MipsCache for PassthroughCache {
-    fn fetch(&self, _virt_addr: u64, phys_addr: u64) -> FetchResult {
+    fn fetch(&self, _virt_addr: u64, phys_addr: u64) -> FetchInstrResult {
         let r = self.downstream.read32(phys_addr as u32);
         if r.is_ok() {
             let slot = unsafe { &mut *self.fetch_scratch.get() };
             if slot.raw != r.data { slot.decoded = false; }
             slot.raw = r.data;
-            FetchResult::Hit(slot as *const DecodedInstr)
-        } else if r.status == BUS_BUSY {
-            FetchResult::Busy
+            FetchInstrResult::hit(slot as *const DecodedInstr)
         } else {
-            FetchResult::Error
+            // BUS_BUSY == EXEC_RETRY (compile-time asserted in traits.rs); pass status through.
+            FetchInstrResult::exception(r.status)
         }
     }
 
@@ -1309,7 +1318,7 @@ impl R4000Cache {
 }
 
 impl MipsCache for R4000Cache {
-    fn fetch(&self, virt_addr: u64, phys_addr: u64) -> FetchResult {
+    fn fetch(&self, virt_addr: u64, phys_addr: u64) -> FetchInstrResult {
         #[cfg(feature = "debug_cache")]
         {
             if self.is_tracking_addr(virt_addr, phys_addr) {
@@ -1337,8 +1346,8 @@ impl MipsCache for R4000Cache {
         if !ic_tag.valid() || ic_tag.ptag() != ptag {
             match self.fill_l1i_line(virt_addr, phys_addr) {
                 FillResult::Ok => {},
-                FillResult::Error => return FetchResult::Error,
-                FillResult::VirtualCoherencyException => return FetchResult::VirtualCoherencyException,
+                FillResult::Error => return FetchInstrResult::exception(exec_exception_const(EXC_IBE)),
+                FillResult::VirtualCoherencyException => return FetchInstrResult::exception(exec_exception_const(EXC_VCEI)),
             }
         } else {
             #[cfg(feature = "developer")]
@@ -1352,7 +1361,7 @@ impl MipsCache for R4000Cache {
         let l2_slot_idx = self.ic.data_as_words()
             [((ic_idx << self.ic.instr_shift) + word_offset) ^ 1] as usize;
         let slot = &self.l2.instrs.get()[l2_slot_idx] as *const DecodedInstr;
-        FetchResult::Hit(slot)
+        FetchInstrResult::hit(slot)
     }
 
     fn read(&self, virt_addr: u64, phys_addr: u64, size: usize) -> BusRead64 {

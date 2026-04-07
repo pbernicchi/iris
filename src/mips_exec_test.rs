@@ -2709,7 +2709,7 @@ mod tests {
         use crate::mips_exec::{MipsExecutor, MipsCpuConfig, EXC_VCED, EXC_VCEI};
         use crate::mips_tlb::PassthroughTlb;
         #[allow(unused_imports)]
-        use crate::mips_cache_v2::{R4000Cache, FetchResult};
+        use crate::mips_cache_v2::R4000Cache;
         #[allow(unused_imports)]
         use crate::mips_core::STATUS_KX;
         use crate::traits::{BUS_OK, BUS_VCE};
@@ -2747,10 +2747,10 @@ mod tests {
         mem.set_word(phys_addr + 0x1000, 0x00000000);
 
         let result = exec.cache.fetch(virt1, phys_addr + 0x1000);
-        assert!(matches!(result, FetchResult::Hit(_)), "First fetch should succeed");
+        assert_eq!(result.status, crate::mips_exec::EXEC_COMPLETE, "First fetch should succeed");
 
         let result = exec.cache.fetch(virt2, phys_addr + 0x1000);
-        assert!(matches!(result, FetchResult::VirtualCoherencyException),
+        assert_eq!(result.status, crate::mips_exec::exec_exception_const(crate::mips_exec::EXC_VCEI),
                    "Second fetch with different virtual index should trigger VCEI");
     }
 
