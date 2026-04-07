@@ -904,12 +904,35 @@ fn emit_shader(
         b.ins().iconst(types::I32, 0)
     };
 
-    // Read/mask for depth:
+    // Read/mask for depth.
+    // For RGB planes: dblsrc selects bank 0 (low bits) or bank 1 (high bits).
+    // For aux planes: bit layout is fixed by plane type (not depth bits).
+    // dblsrc_shift is also the amplify shift for RGB (replicate pixel across its slot width).
     let depth_mask: i64 = match dm1.drawdepth() { 0 => 0xF, 1 => 0xFF, 2 => 0xFFF, _ => 0xFFFFFF };
     let dblsrc_shift: i64 = match dm1.drawdepth() { 0 => 4, 1 => 8, 2 => 12, _ => 0 };
 
+    // For aux planes the read offset and mask differ from RGB:
+    // OLAY bank0: bits[15:8], bank1: bits[23:16], mask=0xFF
+    // CID  bank0: bits[1:0],  bank1: bits[5:4],   mask=0x3
+    // PUP  bank0: bits[3:2],  bank1: bits[7:6],   mask=0x3
+    let (aux_read_shift0, aux_read_shift1, aux_read_mask): (i64, i64, i64) = match dm1.planes() {
+        p if p == DRAWMODE1_PLANES_OLAY => (8,  16, 0xFF),
+        p if p == DRAWMODE1_PLANES_CID  => (0,  4,  0x3),
+        p if p == DRAWMODE1_PLANES_PUP  => (2,  6,  0x3),
+        _                               => (0,  0,  0),
+    };
+
     let dst_plane = if needs_dst {
-        if dm1.dblsrc() && dblsrc_shift > 0 {
+        if use_aux {
+            // Aux plane: extract from fixed bit position
+            let read_shift = if dm1.dblsrc() { aux_read_shift1 } else { aux_read_shift0 };
+            let extracted = if read_shift > 0 {
+                b.ins().ushr_imm(fb_px_raw, read_shift)
+            } else {
+                fb_px_raw
+            };
+            b.ins().band_imm(extracted, aux_read_mask)
+        } else if dm1.dblsrc() && dblsrc_shift > 0 {
             let shifted = b.ins().ushr_imm(fb_px_raw, dblsrc_shift);
             b.ins().band_imm(shifted, depth_mask)
         } else {
@@ -974,13 +997,20 @@ fn emit_shader(
             let inst = b.ins().call(blend_ref, &[src_color, blend_dst, sf_v, df_v]);
             b.inst_results(inst)[0]
         };
-        // bayer_pack + compress
+        // bayer_pack + compress + amplify
         let packed = bayer_pack_ir(&mut b, blended, x_v, y_v);
-        if dm1.rgbmode() && dm1.drawdepth() != 3 {
+        let compressed = if dm1.rgbmode() && dm1.drawdepth() != 3 {
             let inst = b.ins().call(compress_ref, &[packed]);
             b.inst_results(inst)[0]
         } else {
             packed
+        };
+        // Amplify: replicate into both banks (sub-24bpp only; 24bpp is identity)
+        if dblsrc_shift > 0 {
+            let shifted = b.ins().ishl_imm(compressed, dblsrc_shift);
+            b.ins().bor(compressed, shifted)
+        } else {
+            compressed
         }
     } else {
         // Logic op path
@@ -992,14 +1022,21 @@ fn emit_shader(
         } else {
             packed
         };
-        // amplify for dblsrc
-        let amp_src = if dm1.dblsrc() && dblsrc_shift > 0 {
+        // Amplify: replicate pixel into both banks before logic op.
+        // For RGB planes: amplify_rgb_N(v) = v | (v << depth_shift) for sub-24bpp.
+        // For aux planes: use plane-specific amplify packing.
+        // For 24bpp RGB: identity (dblsrc_shift == 0).
+        let amp_src = if use_aux {
+            amplify_aux_ir(&mut b, compressed, dm1.planes())
+        } else if dblsrc_shift > 0 {
             let shifted = b.ins().ishl_imm(compressed, dblsrc_shift);
             b.ins().bor(compressed, shifted)
         } else {
             compressed
         };
-        let amp_dst = if dm1.dblsrc() && dblsrc_shift > 0 {
+        let amp_dst = if use_aux {
+            amplify_aux_ir(&mut b, dst_plane, dm1.planes())
+        } else if dblsrc_shift > 0 {
             let shifted = b.ins().ishl_imm(dst_plane, dblsrc_shift);
             b.ins().bor(dst_plane, shifted)
         } else {
@@ -1250,6 +1287,31 @@ fn and4_range(b: &mut FunctionBuilder, x: Value, y: Value,
     let ok_x = b.ins().band(ok_x_lo, ok_x_hi);
     let ok_y = b.ins().band(ok_y_lo, ok_y_hi);
     b.ins().band(ok_x, ok_y)
+}
+
+/// Amplify an aux-plane pixel value into its packed fb_aux bit position.
+/// Mirrors Rex3::amplify_olay/cid/pup:
+///   OLAY: (val << 8) | (val << 16)  — stores 8-bit value in bits[23:8]
+///   CID:  val | (val << 4)           — stores 2-bit value in bits[5:0]
+///   PUP:  (val << 2) | (val << 6)   — stores 2-bit value in bits[7:2]
+fn amplify_aux_ir(b: &mut FunctionBuilder, val: Value, planes: u32) -> Value {
+    match planes {
+        p if p == DRAWMODE1_PLANES_OLAY => {
+            let v8  = b.ins().ishl_imm(val, 8);
+            let v16 = b.ins().ishl_imm(val, 16);
+            b.ins().bor(v8, v16)
+        }
+        p if p == DRAWMODE1_PLANES_CID => {
+            let v4 = b.ins().ishl_imm(val, 4);
+            b.ins().bor(val, v4)
+        }
+        p if p == DRAWMODE1_PLANES_PUP => {
+            let v2 = b.ins().ishl_imm(val, 2);
+            let v6 = b.ins().ishl_imm(val, 6);
+            b.ins().bor(v2, v6)
+        }
+        _ => val,
+    }
 }
 
 /// Emit a 16-opcode logic operation.

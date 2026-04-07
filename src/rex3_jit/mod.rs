@@ -41,6 +41,8 @@ pub struct ShaderStore {
     pub queued: RwLock<HashSet<(u32, u32)>>,
     /// Set of keys that failed to compile — never retried.
     pub failed: RwLock<HashSet<(u32, u32)>>,
+    /// Set of keys manually disabled via `rex jit disable` — bypassed to interpreter.
+    pub disabled: RwLock<HashSet<(u32, u32)>>,
 }
 
 impl ShaderStore {
@@ -49,6 +51,7 @@ impl ShaderStore {
             cache: RwLock::new(HashMap::new()),
             queued: RwLock::new(HashSet::new()),
             failed: RwLock::new(HashSet::new()),
+            disabled: RwLock::new(HashSet::new()),
         }
     }
 }
@@ -132,13 +135,45 @@ impl RexJit {
     }
 
     /// Look up a compiled shader for the given draw mode pair.
-    /// Returns a raw function pointer if compiled, or None if not yet available.
+    /// Returns None if not compiled, not yet available, or manually disabled.
     #[inline]
     pub fn lookup(&self, dm0: u32, dm1: u32)
         -> Option<unsafe extern "C" fn(*mut Rex3Context, *mut u32, *mut u32)>
     {
+        if self.store.disabled.read().unwrap().contains(&(dm0, dm1)) {
+            return None;
+        }
         let cache = self.store.cache.read().unwrap();
         cache.get(&(dm0, dm1)).map(|s| s.entry)
+    }
+
+    /// Disable a specific compiled shader (force interpreter fallback).
+    pub fn disable_shader(&self, dm0: u32, dm1: u32) {
+        self.store.disabled.write().unwrap().insert((dm0, dm1));
+    }
+
+    /// Re-enable a previously disabled shader.
+    pub fn enable_shader(&self, dm0: u32, dm1: u32) {
+        self.store.disabled.write().unwrap().remove(&(dm0, dm1));
+    }
+
+    /// Return info about all known shaders: (dm0, dm1, status) where status is
+    /// "compiled", "disabled", "failed", or "queued".
+    pub fn shader_list(&self) -> Vec<(u32, u32, &'static str)> {
+        let cache    = self.store.cache.read().unwrap();
+        let disabled = self.store.disabled.read().unwrap();
+        let failed   = self.store.failed.read().unwrap();
+        let queued   = self.store.queued.read().unwrap();
+        let mut all: std::collections::BTreeSet<(u32, u32)> = cache.keys().copied().collect();
+        all.extend(failed.iter().copied());
+        all.extend(queued.iter().copied());
+        all.into_iter().map(|(dm0, dm1)| {
+            let status = if disabled.contains(&(dm0, dm1)) { "disabled" }
+                else if failed.contains(&(dm0, dm1))       { "failed" }
+                else if queued.contains(&(dm0, dm1))       { "queued" }
+                else                                       { "compiled" };
+            (dm0, dm1, status)
+        }).collect()
     }
 
     /// Request background compilation for the given draw mode pair.

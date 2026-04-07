@@ -3567,7 +3567,7 @@ impl Device for Rex3 {
 
     fn register_commands(&self) -> Vec<(String, String)> {
         vec![
-            ("rex".to_string(), "REX3 commands: rex status (includes JIT stats) | rex jit <on|off> | rex debug <on|off> [DEV] | rex cmap <on|off> | rex buslog <on|off> (logs to rex3.log) [DEV]".to_string()),
+            ("rex".to_string(), "REX3 commands: rex status | rex jit <on|off> | rex jit list | rex jit <disable|enable> <dm0> <dm1> | rex debug <on|off> [DEV] | rex cmap <on|off> | rex buslog <on|off> [DEV]".to_string()),
             ("dcb".to_string(), "DCB commands: dcb debug <on|off> [DEV]".to_string()),
             ("vc2".to_string(), "VC2 commands: vc2 status | vc2 debug <on|off> [DEV]".to_string()),
             ("block".to_string(), "Block draw logging: block debug <on|off> [DEV]".to_string()),
@@ -3768,13 +3768,43 @@ impl Device for Rex3 {
 
         #[cfg(feature = "rex-jit")]
         if cmd == "rex" && args[0] == "jit" {
-            let val = match args.get(1).map(|s| *s) {
-                Some("on")  => true,
-                Some("off") => false,
-                _ => return Err("Usage: rex jit <on|off>".to_string()),
-            };
-            self.jit_enabled.store(val, Ordering::Relaxed);
-            writeln!(writer, "REX JIT dispatch: {}", if val { "enabled" } else { "disabled" }).unwrap();
+            match args.get(1).copied() {
+                Some("on") | Some("off") => {
+                    let val = args[1] == "on";
+                    self.jit_enabled.store(val, Ordering::Relaxed);
+                    writeln!(writer, "REX JIT dispatch: {}", if val { "enabled" } else { "disabled" }).unwrap();
+                }
+                Some("list") => {
+                    if let Some(ref jit) = self.rex_jit {
+                        let shaders = jit.shader_list();
+                        if shaders.is_empty() {
+                            writeln!(writer, "No shaders compiled yet.").unwrap();
+                        } else {
+                            writeln!(writer, "{:>8}  {:>10}  {:>10}  {}", "status", "dm0", "dm1", "description").unwrap();
+                            for (dm0, dm1, status) in &shaders {
+                                writeln!(writer, "{:>8}  {:#010x}  {:#010x}  {}  |  {}",
+                                    status, dm0, dm1,
+                                    decode_dm0(*dm0), decode_dm1(*dm1)).unwrap();
+                            }
+                        }
+                    }
+                }
+                Some("disable") | Some("enable") => {
+                    let enable = args[1] == "enable";
+                    let dm0_s = args.get(2).ok_or("Usage: rex jit <disable|enable> <dm0_hex> <dm1_hex>")?;
+                    let dm1_s = args.get(3).ok_or("Usage: rex jit <disable|enable> <dm0_hex> <dm1_hex>")?;
+                    let dm0 = u32::from_str_radix(dm0_s.trim_start_matches("0x"), 16)
+                        .map_err(|_| format!("bad dm0: {dm0_s}"))?;
+                    let dm1 = u32::from_str_radix(dm1_s.trim_start_matches("0x"), 16)
+                        .map_err(|_| format!("bad dm1: {dm1_s}"))?;
+                    if let Some(ref jit) = self.rex_jit {
+                        if enable { jit.enable_shader(dm0, dm1); } else { jit.disable_shader(dm0, dm1); }
+                        writeln!(writer, "Shader dm0={dm0:#010x} dm1={dm1:#010x}: {}",
+                            if enable { "enabled" } else { "disabled" }).unwrap();
+                    }
+                }
+                _ => return Err("Usage: rex jit <on|off> | rex jit list | rex jit <disable|enable> <dm0_hex> <dm1_hex>".to_string()),
+            }
             return Ok(());
         }
 

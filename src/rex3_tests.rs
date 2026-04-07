@@ -2352,4 +2352,27 @@ mod jit_tests {
             dm0, dm1,
         );
     }
+
+    /// Exact menu text draw mode: DRAW BLOCK STOPONY ENLSPAT LSOPAQUE, RGB 8bpp.
+    /// lsopaque=1: pattern bit=0 → draw colorback; bit=1 → draw foreground color.
+    /// This is the most common draw in the popup menu (3416 uses).
+    #[test]
+    fn jit_lspattern_lsopaque_block_ci8() {
+        let dm0 = 0x00022106u32; // DRAW BLOCK STOPONY ENLSPAT LSOPAQUE
+        let dm1 = 0x30007109u32; // planes=RGB 8bpp SRC (CI mode)
+        compare_jit_interp(0, 0, 15, 7,
+            |rex| {
+                reg(rex, REX3_DRAWMODE1, dm1);
+                reg(rex, REX3_WRMASK,    0xFF);
+                reg(rex, REX3_COLORRED,  0x42u32 << 11); // foreground CI index
+                reg(rex, REX3_COLORBACK, 0x07u32);       // background CI index
+                reg(rex, REX3_LSPATTERN, 0xF0F0_F0F0u32); // alternating nibbles
+                reg(rex, REX3_LSMODE,    0);
+                reg(rex, REX3_CLIPMODE,  0xF << 9);      // cidmatch=0xF
+                reg(rex, REX3_XYENDI,    xy(15, 7));
+                reg(rex, REX3_XYSTARTI,  xy(0, 0));
+            },
+            dm0, dm1,
+        );
+    }
 }
