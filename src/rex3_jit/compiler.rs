@@ -588,6 +588,15 @@ fn emit_shader(
     let one8 = b.ins().iconst(types::I8, 1);
     st_bool!(ctx_off!(mid_primitive), one8);
 
+    // LRONLY span mode: draw_span returns early (no pixels, no shade) when x_dec=1.
+    // Emit a runtime check here — jump straight to loop_end if x_dec is set.
+    if dm0.lronly() && !is_block {
+        let done_block = b.create_block();
+        b.ins().brif(x_dec_v, loop_end, &[], done_block, &[]);
+        b.switch_to_block(done_block);
+        b.seal_block(done_block);
+    }
+
     b.ins().jump(loop_header, &init_args);
 
     // ── loop_header ───────────────────────────────────────────────────────────
@@ -637,6 +646,15 @@ fn emit_shader(
     // icmp returns I8 in Cranelift 0.116; brif treats any non-zero as true.
     // Use icmp_imm Equal/NotEqual to get clean 0/1 rather than bnot (which gives 0xFE).
     // skip if: (skipfirst && first) || (skiplast && x_end_reached)
+    //
+    // LRONLY (block mode): skip pixel when x_dec=1, but shade/pattern still advance.
+    // LRONLY (span mode):  draw_span returns early (no shade either); for the JIT we
+    //                      bail out immediately via an early return at shader entry.
+    //
+    // For span+lronly+x_dec: we handle this with an early-exit at the top of the shader
+    // (jump directly to loop_end before any pixel or shade work) so the loop body is
+    // never entered at all — matching draw_span's `return` with no side effects.
+    // That early-exit is emitted below for the span+lronly case.
     let do_pixel: Value = if dm0.skipfirst() && dm0.skiplast() {
         let first_is_zero   = b.ins().icmp_imm(IntCC::Equal, first_v, 0);     // 1 if not-first
         let not_x_end       = b.ins().icmp_imm(IntCC::Equal, x_end_reached, 0); // 1 if not-last
@@ -649,10 +667,13 @@ fn emit_shader(
         b.ins().iconst(types::I8, 1) // always draw
     };
 
-    // lronly: skip if x_dec (right-to-left direction), handled by skipping entire primitive
-    // Actually lronly skips if x_dec — we check at entry to draw_span/draw_block.
-    // For JIT: if lronly and x_dec we don't emit pixels (whole draw is a no-op).
-    // This is handled in execute_go before calling the shader, so we don't special-case here.
+    // LRONLY block mode: AND with !x_dec (skip pixel when x_dec=1, shade still runs).
+    let do_pixel = if dm0.lronly() && is_block {
+        let not_x_dec = b.ins().icmp_imm(IntCC::Equal, x_dec_v, 0); // 1 when x_dec=0
+        b.ins().band(do_pixel, not_x_dec)
+    } else {
+        do_pixel
+    };
 
     // Jump to loop_body if do_pixel, else skip to loop_next_x
     let pixel_block = b.create_block();

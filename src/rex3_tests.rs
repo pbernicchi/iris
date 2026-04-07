@@ -2353,6 +2353,125 @@ mod jit_tests {
         );
     }
 
+    /// Shade span with negative slope: color ramps down from high to zero and stays there.
+    #[test]
+    fn jit_shade_negative_slope() {
+        let dm1 = DM1_RGB24_SRC;
+        let dm0 = DM0_DRAW_SPAN | (1 << 18); // shade
+        // slope = -5 << 11; start at 200 so it hits 0 partway through
+        compare_jit_interp(0, 0, 15, 0,
+            |rex| {
+                reg(rex, REX3_DRAWMODE1, dm1);
+                reg(rex, REX3_WRMASK,    0xFFFFFF);
+                reg(rex, REX3_COLORRED,  40u32 << 11);
+                reg(rex, REX3_COLORGRN,  0u32);
+                reg(rex, REX3_COLORBLUE, 0u32);
+                // negative slope: bit31=sign, lower bits = magnitude
+                reg(rex, REX3_SLOPERED,  0x8000_2800u32); // -5 << 11 = -0x2800
+                reg(rex, REX3_SLOPEGRN,  0);
+                reg(rex, REX3_SLOPEBLUE, 0);
+                reg(rex, REX3_XYENDI,    xy(15, 0));
+                reg(rex, REX3_XYSTARTI,  xy(0, 0));
+            },
+            dm0, dm1,
+        );
+    }
+
+    /// Shade block with negative slopes on all three channels.
+    #[test]
+    fn jit_shade_negative_slope_block() {
+        let dm1 = DM1_RGB24_SRC;
+        let dm0 = DM0_DRAW_BLOCK | (1 << 18); // shade
+        compare_jit_interp(0, 0, 7, 7,
+            |rex| {
+                reg(rex, REX3_DRAWMODE1, dm1);
+                reg(rex, REX3_WRMASK,    0xFFFFFF);
+                reg(rex, REX3_COLORRED,  0xC0u32 << 11);   // start at 192
+                reg(rex, REX3_COLORGRN,  0x80u32 << 11);   // start at 128
+                reg(rex, REX3_COLORBLUE, 0x40u32 << 11);   // start at 64
+                reg(rex, REX3_SLOPERED,  0x8000_3000u32);  // -6 << 11
+                reg(rex, REX3_SLOPEGRN,  0x8000_1800u32);  // -3 << 11
+                reg(rex, REX3_SLOPEBLUE, 0x8000_0800u32);  // -1 << 11
+                reg(rex, REX3_XYENDI,    xy(7, 7));
+                reg(rex, REX3_XYSTARTI,  xy(0, 0));
+            },
+            dm0, dm1,
+        );
+    }
+
+    /// RGB 12bpp + SHADE + DITHER block — exact octahedra screensaver draw modes.
+    /// dm0=0x002c0126: DRAW BLOCK DOSETUP STOPONX SHADE LRONLY CICLAMP
+    /// dm1=0x3009f011: RGB 12bpp host:12bpp logicop:SRC RGB DITHER
+    #[test]
+    fn jit_shade_rgb12_dither_block() {
+        let dm0 = 0x002c0126u32;
+        let dm1 = 0x3009f011u32;
+        compare_jit_interp(5, 5, 20, 5,
+            |rex| {
+                reg(rex, REX3_DRAWMODE1, dm1);
+                reg(rex, REX3_WRMASK,    0xFFFFFF);
+                reg(rex, REX3_COLORRED,  0x80u32 << 11);
+                reg(rex, REX3_COLORGRN,  0x40u32 << 11);
+                reg(rex, REX3_COLORBLUE, 0x20u32 << 11);
+                reg(rex, REX3_SLOPERED,  3u32 << 11);
+                reg(rex, REX3_SLOPEGRN,  2u32 << 11);
+                reg(rex, REX3_SLOPEBLUE, 1u32 << 11);
+                reg(rex, REX3_XYENDI,    xy(20, 5));
+                reg(rex, REX3_XYSTARTI,  xy(5, 5));
+            },
+            dm0, dm1,
+        );
+    }
+
+    /// RGB 12bpp + SHADE + DITHER block, negative slopes — tests clamp-to-zero.
+    #[test]
+    fn jit_shade_rgb12_dither_negative() {
+        let dm0 = 0x002c0126u32;
+        let dm1 = 0x3009f011u32;
+        compare_jit_interp(5, 5, 20, 5,
+            |rex| {
+                reg(rex, REX3_DRAWMODE1, dm1);
+                reg(rex, REX3_WRMASK,    0xFFFFFF);
+                reg(rex, REX3_COLORRED,  0xA0u32 << 11);
+                reg(rex, REX3_COLORGRN,  0x60u32 << 11);
+                reg(rex, REX3_COLORBLUE, 0x20u32 << 11);
+                reg(rex, REX3_SLOPERED,  0x8000_4000u32); // -8 << 11
+                reg(rex, REX3_SLOPEGRN,  0x8000_2000u32); // -4 << 11
+                reg(rex, REX3_SLOPEBLUE, 0x8000_1000u32); // -2 << 11
+                reg(rex, REX3_XYENDI,    xy(20, 5));
+                reg(rex, REX3_XYSTARTI,  xy(5, 5));
+            },
+            dm0, dm1,
+        );
+    }
+
+    /// LRONLY block: pixels skipped when x_dec=1 (right-to-left), shade always advances.
+    /// Set x_dec=1 by making xend < xstart (decreasing x direction).
+    #[test]
+    fn jit_lronly_block_xdec() {
+        let dm0 = DM0_DRAW_BLOCK | (1 << 18) | (1 << 19); // shade + lronly
+        let dm1 = DM1_RGB24_SRC;
+        // x_dec=1: xstart > xend, octant has XDEC set by dosetup
+        // Use dosetup so octant is derived from coordinates
+        let dm0 = dm0 | (1 << 5); // dosetup
+        compare_jit_interp(0, 0, 15, 7,
+            |rex| {
+                reg(rex, REX3_DRAWMODE1, dm1);
+                reg(rex, REX3_WRMASK,    0xFFFFFF);
+                reg(rex, REX3_COLORRED,  0x80u32 << 11);
+                reg(rex, REX3_COLORGRN,  0u32);
+                reg(rex, REX3_COLORBLUE, 0u32);
+                reg(rex, REX3_SLOPERED,  5u32 << 11);
+                reg(rex, REX3_SLOPEGRN,  0);
+                reg(rex, REX3_SLOPEBLUE, 0);
+                // xstart > xend → x_dec direction
+                reg(rex, REX3_XYSTARTI,  xy(15, 0));
+                reg(rex, REX3_XYENDI,    xy(0, 7));
+            },
+            dm0, dm1,
+        );
+    }
+
     /// Exact menu text draw mode: DRAW BLOCK STOPONY ENLSPAT LSOPAQUE, RGB 8bpp.
     /// lsopaque=1: pattern bit=0 → draw colorback; bit=1 → draw foreground color.
     /// This is the most common draw in the popup menu (3416 uses).
