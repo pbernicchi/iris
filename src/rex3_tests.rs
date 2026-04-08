@@ -2768,4 +2768,57 @@ mod jit_tests {
             dm0, dm1,
         );
     }
+
+    /// SCR2SCR block copy (CI8): mirrors test_ng1_scrtoscr.
+    /// Source at (0,0)..(7,7) painted 0xCC; copied to (16,0)..(23,7) via XYMOVE=(16,0).
+    #[test]
+    fn jit_scr2scr_ci8_block() {
+        let dm1 = DM1_CI8_SRC;
+        let dm0 = DM0_SCR2SCR;
+        compare_jit_interp(16, 0, 23, 7,
+            |rex| {
+                // Paint source region
+                reg(rex, REX3_DRAWMODE1, DM1_CI8_SRC);
+                reg(rex, REX3_WRMASK,   0xFF);
+                reg(rex, REX3_COLORI,   0xCC);
+                reg(rex, REX3_XYSTARTI, xy(0, 0));
+                reg(rex, REX3_XYENDI,   xy(7, 7));
+                reg_go(rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+                // Set up SCR2SCR registers
+                reg(rex, REX3_DRAWMODE1, DM1_CI8_SRC);
+                reg(rex, REX3_WRMASK,   0xFF);
+                reg(rex, REX3_XYMOVE,   (16u32 << 16) | 0);
+                reg(rex, REX3_XYSTARTI, xy(0, 0));
+                reg(rex, REX3_XYENDI,   xy(7, 7));
+            },
+            dm0, dm1,
+        );
+    }
+
+    /// SCR2SCR block copy (RGB24): copy a colored rectangle.
+    #[test]
+    fn jit_scr2scr_rgb24_block() {
+        let dm1 = DM1_RGB24_SRC;
+        let dm0 = DM0_SCR2SCR;
+        compare_jit_interp(20, 0, 27, 7,
+            |rex| {
+                // Paint source region in RGB24
+                reg(rex, REX3_DRAWMODE1, DM1_RGB24_SRC);
+                reg(rex, REX3_WRMASK,   0xFFFFFF);
+                reg(rex, REX3_COLORRED, 0xAA << 11);
+                reg(rex, REX3_COLORGRN, 0x55 << 11);
+                reg(rex, REX3_COLORBLUE, 0x11 << 11);
+                reg(rex, REX3_XYSTARTI, xy(0, 0));
+                reg(rex, REX3_XYENDI,   xy(7, 7));
+                reg_go(rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+                // Set up SCR2SCR registers (xymove shifts dst by +20,0)
+                reg(rex, REX3_DRAWMODE1, DM1_RGB24_SRC);
+                reg(rex, REX3_WRMASK,   0xFFFFFF);
+                reg(rex, REX3_XYMOVE,   (20u32 << 16) | 0);
+                reg(rex, REX3_XYSTARTI, xy(0, 0));
+                reg(rex, REX3_XYENDI,   xy(7, 7));
+            },
+            dm0, dm1,
+        );
+    }
 }

@@ -3020,9 +3020,14 @@ impl Rex3 {
             if self.jit_enabled.load(Ordering::Relaxed) {
             if let Some(ref jit) = self.rex_jit {
                 let dm0 = ctx.drawmode0.0;
-                let dm1 = ctx.drawmode1.0;
+                // Normalize dm1 key to match compile_shader's normalization:
+                // fastclear clears blend; scr2scr clears dither (copies quantized pixels).
+                let dm1_raw = ctx.drawmode1.0;
+                let dm1 = if dm1_raw & (1 << 17) != 0 { dm1_raw & !(1 << 18) }       // fastclear→no blend
+                          else if opcode == DRAWMODE0_OPCODE_SCR2SCR { dm1_raw & !(1 << 16) } // scr2scr→no dither
+                          else { dm1_raw };
                 let adrmode = ctx.drawmode0.adrmode() << 2;
-                let is_jittable = opcode == DRAWMODE0_OPCODE_DRAW
+                let is_jittable = (opcode == DRAWMODE0_OPCODE_DRAW || opcode == DRAWMODE0_OPCODE_SCR2SCR)
                     && (adrmode == DRAWMODE0_ADRMODE_BLOCK || adrmode == DRAWMODE0_ADRMODE_SPAN)
                     && !ctx.drawmode0.colorhost()
                     && !ctx.drawmode0.alphahost();
@@ -3586,7 +3591,7 @@ impl Device for Rex3 {
 
     fn register_commands(&self) -> Vec<(String, String)> {
         vec![
-            ("rex".to_string(), "REX3 commands: rex status | rex jit <on|off> | rex jit list | rex jit <disable|enable> <dm0> <dm1> | rex debug <on|off> [DEV] | rex cmap <on|off> | rex buslog <on|off> [DEV]".to_string()),
+            ("rex".to_string(), "REX3 commands: rex status | rex jit <on|off|status|list> | rex jit <disable|enable> <dm0> <dm1> | rex debug <on|off> [DEV] | rex cmap <on|off> | rex buslog <on|off> [DEV]".to_string()),
             ("dcb".to_string(), "DCB commands: dcb debug <on|off> [DEV]".to_string()),
             ("vc2".to_string(), "VC2 commands: vc2 status | vc2 debug <on|off> [DEV]".to_string()),
             ("block".to_string(), "Block draw logging: block debug <on|off> [DEV]".to_string()),
@@ -3659,26 +3664,16 @@ impl Device for Rex3 {
             #[cfg(feature = "rex-jit")]
             {
                 if let Some(ref jit) = self.rex_jit {
-                    let pairs = jit.compiled_pairs();
                     let enabled = self.jit_enabled.load(Ordering::Relaxed);
-                    writeln!(writer, "--- JIT : {} ---", if enabled { "enabled" } else { "DISABLED" }).unwrap();
-                    writeln!(writer, "Compiled  : {}  Queued : {}",
-                        pairs.len(), jit.queued_count()).unwrap();
-                    if pairs.is_empty() {
-                        writeln!(writer, "(no compiled shaders yet)").unwrap();
-                    } else {
-                        for (dm0, dm1) in &pairs {
-                            writeln!(writer, "  dm0={:#010x}  dm1={:#010x}  {}  {}",
-                                dm0, dm1,
-                                decode_dm0(*dm0), decode_dm1(*dm1)).unwrap();
-                        }
-                    }
+                    writeln!(writer, "JIT       : {}  compiled={} queued={}  (rex jit status for details)",
+                        if enabled { "enabled" } else { "DISABLED" },
+                        jit.compiled_count(), jit.queued_count()).unwrap();
                 } else {
-                    writeln!(writer, "--- JIT : disabled (rex_jit not initialised) ---").unwrap();
+                    writeln!(writer, "JIT       : not initialised").unwrap();
                 }
             }
             #[cfg(not(feature = "rex-jit"))]
-            writeln!(writer, "--- JIT : not compiled in (build without --features rex-jit) ---").unwrap();
+            writeln!(writer, "JIT       : not compiled in").unwrap();
             return Ok(());
         }
 
@@ -3794,17 +3789,52 @@ impl Device for Rex3 {
                     self.jit_last.set((0, 0, None));
                     writeln!(writer, "REX JIT dispatch: {}", if val { "enabled" } else { "disabled" }).unwrap();
                 }
+                Some("status") => {
+                    if let Some(ref jit) = self.rex_jit {
+                        let enabled = self.jit_enabled.load(Ordering::Relaxed);
+                        let shaders = jit.shader_list();
+                        let compiled: Vec<_> = shaders.iter().filter(|s| s.status == "compiled" || s.status == "disabled").collect();
+                        let total_bytes: u32 = compiled.iter().map(|s| s.code_bytes).sum();
+                        writeln!(writer, "REX3 JIT: {}  compiled={}  queued={}  failed={}  code={} bytes",
+                            if enabled { "enabled" } else { "DISABLED" },
+                            compiled.len(), jit.queued_count(),
+                            shaders.iter().filter(|s| s.status == "failed").count(),
+                            total_bytes).unwrap();
+                        if !compiled.is_empty() {
+                            #[cfg(feature = "developer")]
+                            writeln!(writer, "{:>8}  {:>10}  {:>10}  {:>6}  {:>8}  {}",
+                                "status", "dm0", "dm1", "bytes", "hits", "description").unwrap();
+                            #[cfg(not(feature = "developer"))]
+                            writeln!(writer, "{:>8}  {:>10}  {:>10}  {:>6}  {}",
+                                "status", "dm0", "dm1", "bytes", "description").unwrap();
+                            for s in &shaders {
+                                if s.status == "compiled" || s.status == "disabled" {
+                                    #[cfg(feature = "developer")]
+                                    writeln!(writer, "{:>8}  {:#010x}  {:#010x}  {:>6}  {:>8}  {}  |  {}",
+                                        s.status, s.dm0, s.dm1, s.code_bytes, s.hit_count,
+                                        decode_dm0(s.dm0), decode_dm1(s.dm1)).unwrap();
+                                    #[cfg(not(feature = "developer"))]
+                                    writeln!(writer, "{:>8}  {:#010x}  {:#010x}  {:>6}  {}  |  {}",
+                                        s.status, s.dm0, s.dm1, s.code_bytes,
+                                        decode_dm0(s.dm0), decode_dm1(s.dm1)).unwrap();
+                                }
+                            }
+                        }
+                    } else {
+                        writeln!(writer, "REX JIT: not initialised").unwrap();
+                    }
+                }
                 Some("list") => {
                     if let Some(ref jit) = self.rex_jit {
                         let shaders = jit.shader_list();
                         if shaders.is_empty() {
                             writeln!(writer, "No shaders compiled yet.").unwrap();
                         } else {
-                            writeln!(writer, "{:>8}  {:>10}  {:>10}  {}", "status", "dm0", "dm1", "description").unwrap();
-                            for (dm0, dm1, status) in &shaders {
-                                writeln!(writer, "{:>8}  {:#010x}  {:#010x}  {}  |  {}",
-                                    status, dm0, dm1,
-                                    decode_dm0(*dm0), decode_dm1(*dm1)).unwrap();
+                            writeln!(writer, "{:>8}  {:>10}  {:>10}  {:>6}  {}", "status", "dm0", "dm1", "bytes", "description").unwrap();
+                            for s in &shaders {
+                                writeln!(writer, "{:>8}  {:#010x}  {:#010x}  {:>6}  {}  |  {}",
+                                    s.status, s.dm0, s.dm1, s.code_bytes,
+                                    decode_dm0(s.dm0), decode_dm1(s.dm1)).unwrap();
                             }
                         }
                     }
@@ -3825,7 +3855,7 @@ impl Device for Rex3 {
                             if enable { "enabled" } else { "disabled" }).unwrap();
                     }
                 }
-                _ => return Err("Usage: rex jit <on|off> | rex jit list | rex jit <disable|enable> <dm0_hex> <dm1_hex>".to_string()),
+                _ => return Err("Usage: rex jit <on|off|status|list> | rex jit <disable|enable> <dm0_hex> <dm1_hex>".to_string()),
             }
             return Ok(());
         }

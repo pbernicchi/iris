@@ -26,7 +26,7 @@ use cranelift_module::{Linkage, Module};
 
 use crate::rex3::{
     Rex3Context,
-    DRAWMODE0_OPCODE_DRAW, DRAWMODE0_ADRMODE_BLOCK, DRAWMODE0_ADRMODE_SPAN,
+    DRAWMODE0_OPCODE_DRAW, DRAWMODE0_OPCODE_SCR2SCR, DRAWMODE0_ADRMODE_BLOCK, DRAWMODE0_ADRMODE_SPAN,
     DRAWMODE1_PLANES_RGB, DRAWMODE1_PLANES_RGBA,
     DRAWMODE1_PLANES_OLAY, DRAWMODE1_PLANES_PUP, DRAWMODE1_PLANES_CID,
     OCTANT_XDEC, OCTANT_YDEC,
@@ -109,21 +109,25 @@ impl ShaderCompiler {
     }
 
     /// Compile a shader for the given (DrawMode0, DrawMode1) pair.
-    /// Returns the compiled function entry point, or None if this mode is not JIT-able.
+    /// Returns `(entry_fn, code_bytes)`, or None if this mode is not JIT-able.
     pub fn compile_shader(&mut self, dm0_val: u32, dm1_val: u32)
-        -> Option<unsafe extern "C" fn(*mut Rex3Context, *mut u32, *mut u32)>
+        -> Option<(unsafe extern "C" fn(*mut Rex3Context, *mut u32, *mut u32), u32)>
     {
         let dm0 = Dm0 { val: dm0_val };
 
-        // Only DRAW opcode, SPAN or BLOCK adrmode (no host FIFO, no lines).
+        // Only DRAW/SCR2SCR opcodes, SPAN or BLOCK adrmode (no host FIFO, no lines).
         let opcode = dm0.opcode();
         let adrmode = dm0.adrmode() << 2; // match the <<2 convention from rex3.rs
-        if opcode != DRAWMODE0_OPCODE_DRAW { return None; }
+        let is_scr2scr = opcode == DRAWMODE0_OPCODE_SCR2SCR;
+        if opcode != DRAWMODE0_OPCODE_DRAW && !is_scr2scr { return None; }
         if dm0.colorhost() || dm0.alphahost() { return None; }
         if adrmode != DRAWMODE0_ADRMODE_SPAN && adrmode != DRAWMODE0_ADRMODE_BLOCK { return None; }
 
         // fastclear takes priority over blend — hardware ignores blend when fastclear=1.
-        let dm1_val = if dm1_val & (1 << 17) != 0 { dm1_val & !(1 << 18) } else { dm1_val };
+        // SCR2SCR copies already-quantized pixels — dithering would corrupt them (matches execute_go).
+        let dm1_val = if dm1_val & (1 << 17) != 0 { dm1_val & !(1 << 18) }
+                      else if is_scr2scr          { dm1_val & !(1 << 16) } // clear DITHER
+                      else                        { dm1_val };
         let dm1 = Dm1 { val: dm1_val };
 
         let name = format!("rex_shader_{:08x}_{:08x}_{}", dm0_val, dm1_val, self.counter);
@@ -150,6 +154,7 @@ impl ShaderCompiler {
             &mut self.ctx.func,
             &mut self.builder_ctx,
             &dm0, &dm1,
+            is_scr2scr,
             ptr_type,
         );
 
@@ -168,6 +173,10 @@ impl ShaderCompiler {
             self.jit_module.clear_context(&mut self.ctx);
             return None;
         }
+        // Read code size before clearing context (compiled_code is cleared by clear_context).
+        let code_bytes = self.ctx.compiled_code()
+            .map(|cc| cc.code_buffer().len() as u32)
+            .unwrap_or(0);
         self.jit_module.clear_context(&mut self.ctx);
         if let Err(e) = self.jit_module.finalize_definitions() {
             eprintln!("REX JIT: finalize_definitions failed: {e}");
@@ -175,9 +184,10 @@ impl ShaderCompiler {
         }
 
         let code_ptr = self.jit_module.get_finalized_function(func_id);
-        Some(unsafe {
+        let entry = unsafe {
             std::mem::transmute::<*const u8, unsafe extern "C" fn(*mut Rex3Context, *mut u32, *mut u32)>(code_ptr)
-        })
+        };
+        Some((entry, code_bytes))
     }
 }
 
@@ -205,8 +215,64 @@ struct PixelCtx {
     fb_aux:      Value, // ptr
 }
 
+/// Mirrors Rex3::calculate_src_address.
+/// Source address for scr2scr: just xywin applied (no xymove, no smask clipping).
+/// On OOB: branches to `src_oob` block (caller puts 0 color there).
+/// On hit: falls through and returns `src_px_ptr`.
+fn emit_calculate_src_address(
+    b:          &mut FunctionBuilder,
+    x_v:        Value,
+    y_v:        Value,
+    pctx:       &PixelCtx,
+    src_oob:    ir::Block,
+    dm1:        &Dm1,
+    coord_bias: Value,
+    c0:         Value,
+    c2048:      Value,
+) -> Value { // src_px_ptr
+    // Source: (x, y) + xywin — no xymove, no smask (matches calculate_src_address).
+    let xw_raw = b.ins().ushr_imm(pctx.xywin_v, 16);
+    let xw16   = b.ins().ireduce(types::I16, xw_raw);
+    let xw32   = b.ins().sextend(types::I32, xw16);
+    let yw_raw = b.ins().band_imm(pctx.xywin_v, 0xFFFF_i64);
+    let yw16   = b.ins().ireduce(types::I16, yw_raw);
+    let yw32   = b.ins().sextend(types::I32, yw16);
+    let x_abs  = b.ins().iadd(x_v, xw32);
+    let y_abs  = b.ins().iadd(y_v, yw32);
+
+    let x_phys = b.ins().isub(x_abs, coord_bias);
+    let y_phys = if dm1.yflip() {
+        let c23ff = b.ins().iconst(types::I32, 0x23FF);
+        b.ins().isub(c23ff, y_abs)
+    } else {
+        b.ins().isub(y_abs, coord_bias)
+    };
+
+    let screen_w = b.ins().iconst(types::I32, REX3_SCREEN_WIDTH as i64);
+    let screen_h = b.ins().iconst(types::I32, REX3_SCREEN_HEIGHT as i64);
+    let xn = b.ins().icmp(IntCC::SignedLessThan, x_phys, c0);
+    let xw = b.ins().icmp(IntCC::SignedGreaterThanOrEqual, x_phys, screen_w);
+    let yn = b.ins().icmp(IntCC::SignedLessThan, y_phys, c0);
+    let yt = b.ins().icmp(IntCC::SignedGreaterThanOrEqual, y_phys, screen_h);
+    let ab  = b.ins().bor(xn, xw);
+    let cd  = b.ins().bor(yn, yt);
+    let oob = b.ins().bor(ab, cd);
+    let in_bounds = b.create_block();
+    b.ins().brif(oob, src_oob, &[], in_bounds, &[]);
+    b.switch_to_block(in_bounds); b.seal_block(in_bounds);
+
+    let ym2048    = b.ins().imul(y_phys, c2048);
+    let addr_i32  = b.ins().iadd(ym2048, x_phys);
+    let c4        = b.ins().iconst(types::I32, 4);
+    let byte_off  = b.ins().imul(addr_i32, c4);
+    let byte_off64 = b.ins().uextend(types::I64, byte_off);
+    // src always reads from fb_rgb (scr2scr doesn't copy aux planes)
+    b.ins().iadd(pctx.fb_rgb, byte_off64)
+}
+
 /// Mirrors Rex3::calculate_fb_address.
-/// Emits xymove, xywin, smask clipping, bounds check.
+/// Emits xymove (unconditional for scr2scr, conditional on xyoffset for draw),
+/// xywin, smask clipping, bounds check.
 /// On clip/OOB miss: branches to `skip_block`.
 /// On hit: falls through to a new `in_bounds` block and returns `(px_ptr, x_bayer, y_bayer)`.
 /// `x_bayer`/`y_bayer` are the window-relative coords (before xywin bias) — used for dither packing.
@@ -218,13 +284,16 @@ fn emit_calculate_fb_address(
     skip_block: ir::Block,
     dm0:        &Dm0,
     dm1:        &Dm1,
+    is_scr2scr: bool,
     coord_bias: Value,
     c0:         Value,
     c2048:      Value,
     ptr_type:   ir::Type,
 ) -> (Value, Value, Value) { // (px_ptr, x_bayer, y_bayer)
-    // 1. Apply xymove (only for fb address, not for source address)
-    let (x_curr, y_curr) = if dm0.xyoffset() {
+    // 1. Apply xymove: always in scr2scr (destination offset), conditional on xyoffset in draw.
+    //    Mirrors: apply_xymove = is_scr2scr || ctx.drawmode0.xyoffset()
+    let apply_xymove = is_scr2scr || dm0.xyoffset();
+    let (x_curr, y_curr) = if apply_xymove {
         let xm_raw = b.ins().ushr_imm(pctx.xymove_v, 16);
         let xm16   = b.ins().ireduce(types::I16, xm_raw);
         let xm32   = b.ins().sextend(types::I32, xm16);
@@ -487,6 +556,7 @@ fn emit_shader(
     builder_ctx: &mut FunctionBuilderContext,
     dm0: &Dm0,
     dm1: &Dm1,
+    is_scr2scr: bool,
     ptr_type: ir::Type,
 ) -> bool {
     let mut b = FunctionBuilder::new(func, builder_ctx);
@@ -765,99 +835,124 @@ fn emit_shader(
     };
 
     let (px_ptr, x_bayer, y_bayer) = emit_calculate_fb_address(
-        &mut b, x_v, y_v, &pctx, skip_block, dm0, dm1,
+        &mut b, x_v, y_v, &pctx, skip_block, dm0, dm1, is_scr2scr,
         coord_bias, c0, c2048, ptr_type,
     );
 
+    // depth_mask used by scr2scr src read and by emit_pixel_write.
+    let depth_mask: i64 = match dm1.drawdepth() { 0 => 0xF, 1 => 0xFF, 2 => 0xFFF, _ => 0xFFFFFF };
+
     // ── Source color ──────────────────────────────────────────────────────────
-    let raw_src = if dm0.shade() {
-        // combine_host_dda: RGB clamp per component
-        let r = clamp_color_component(&mut b, colorred_v);
-        let g = clamp_color_component(&mut b, colorgrn_v);
-        let bl = clamp_color_component(&mut b, colorblue_v);
-        let g8  = b.ins().ishl_imm(g, 8);
-        let bl16 = b.ins().ishl_imm(bl, 16);
-        let rb  = b.ins().bor(r, g8);
-        b.ins().bor(rb, bl16)
+    // Mirrors process_pixel_scr2scr (src from fb) vs process_pixel_draw (shade DDA / registers).
+    let src_color: Value = if is_scr2scr {
+        // Mirrors calculate_src_address + expand(rd(src_addr)).
+        // src_oob: src pixel out of bounds → use 0 as source, still write dst.
+        let src_oob    = b.create_block();
+        let src_valid  = b.create_block();
+        b.append_block_param(src_valid, types::I32); // raw_src value
+        let src_ptr = emit_calculate_src_address(
+            &mut b, x_v, y_v, &pctx, src_oob, dm1, coord_bias, c0, c2048,
+        );
+        // In-bounds: read fb_rgb and expand (matches expand_fn(rd_fn(src_addr))).
+        let src_raw = b.ins().load(types::I32, memv, src_ptr, ir::immediates::Offset32::new(0));
+        let src_masked = b.ins().band_imm(src_raw, depth_mask as i64);
+        let src_expanded = if dm1.rgbmode() && dm1.drawdepth() != 3 {
+            emit_expand_ir(&mut b, src_masked, dm1.drawdepth())
+        } else {
+            src_masked
+        };
+        b.ins().jump(src_valid, &[src_expanded]);
+        // Out-of-bounds: source = 0.
+        b.switch_to_block(src_oob); b.seal_block(src_oob);
+        let zero = b.ins().iconst(types::I32, 0);
+        b.ins().jump(src_valid, &[zero]);
+        b.switch_to_block(src_valid); b.seal_block(src_valid);
+        b.block_params(src_valid).to_vec()[0]
     } else {
-        // Solid color from colorred (CI) or colorred/grn/blue (RGB)
-        if dm1.rgbmode() {
-            let r = ld32!(ctx_off!(colorred));
-            let g = ld32!(ctx_off!(colorgrn));
-            let bl = ld32!(ctx_off!(colorblue));
-            let r_c  = clamp_color_component(&mut b, r);
-            let g_c  = clamp_color_component(&mut b, g);
-            let b_c  = clamp_color_component(&mut b, bl);
-            let g8   = b.ins().ishl_imm(g_c, 8);
-            let bl16 = b.ins().ishl_imm(b_c, 16);
-            let rb   = b.ins().bor(r_c, g8);
+        // Mirrors process_pixel_draw source resolution.
+        let raw_src = if dm0.shade() {
+            // combine_host_dda: RGB clamp per component
+            let r  = clamp_color_component(&mut b, colorred_v);
+            let g  = clamp_color_component(&mut b, colorgrn_v);
+            let bl = clamp_color_component(&mut b, colorblue_v);
+            let g8   = b.ins().ishl_imm(g, 8);
+            let bl16 = b.ins().ishl_imm(bl, 16);
+            let rb   = b.ins().bor(r, g8);
             b.ins().bor(rb, bl16)
         } else {
-            // CI mode: colorred >> 11
-            let cr = ld32!(ctx_off!(colorred));
-            b.ins().sshr(cr, c11)
+            // Solid color from colorred (CI) or colorred/grn/blue (RGB)
+            if dm1.rgbmode() {
+                let r  = ld32!(ctx_off!(colorred));
+                let g  = ld32!(ctx_off!(colorgrn));
+                let bl = ld32!(ctx_off!(colorblue));
+                let r_c  = clamp_color_component(&mut b, r);
+                let g_c  = clamp_color_component(&mut b, g);
+                let b_c  = clamp_color_component(&mut b, bl);
+                let g8   = b.ins().ishl_imm(g_c, 8);
+                let bl16 = b.ins().ishl_imm(b_c, 16);
+                let rb   = b.ins().bor(r_c, g8);
+                b.ins().bor(rb, bl16)
+            } else {
+                // CI mode: colorred >> 11
+                let cr = ld32!(ctx_off!(colorred));
+                b.ins().sshr(cr, c11)
+            }
+        };
+
+        // Pattern check: may replace raw_src with colorback (zpopaque/lsopaque)
+        // or skip pixel entirely. draw_block carries use_bg_flag as a block param.
+        let draw_block = b.create_block();
+        b.append_block_param(draw_block, types::I8); // use_bg_flag
+        let mut cur_use_bg: Value = b.ins().iconst(types::I8, 0);
+
+        if dm0.enzpattern() {
+            let zp_block = b.create_block();
+            let zp_pass  = b.create_block();
+            b.append_block_param(zp_pass, types::I8);
+            let zpattern_v   = ld32!(ctx_off!(zpattern));
+            let zpat_bit32   = b.ins().uextend(types::I32, zpat_bit_v);
+            let zpat_shifted = b.ins().ushr(zpattern_v, zpat_bit32);
+            let bit_v  = b.ins().band_imm(zpat_shifted, 1);
+            let bit_set = b.ins().icmp_imm(IntCC::NotEqual, bit_v, 0);
+            b.ins().brif(bit_set, zp_pass, &[cur_use_bg], zp_block, &[]);
+            b.switch_to_block(zp_block); b.seal_block(zp_block);
+            if dm0.zpopaque() {
+                let bg1 = b.ins().iconst(types::I8, 1);
+                b.ins().jump(zp_pass, &[bg1]);
+            } else {
+                b.ins().jump(skip_block, &[]);
+            }
+            b.switch_to_block(zp_pass); b.seal_block(zp_pass);
+            cur_use_bg = b.block_params(zp_pass).to_vec()[0];
         }
+
+        if dm0.enlspattern() {
+            let ls_block = b.create_block();
+            let ls_pass  = b.create_block();
+            b.append_block_param(ls_pass, types::I8);
+            let lspattern_v  = ld32!(ctx_off!(lspattern));
+            let pat_bit32    = b.ins().uextend(types::I32, pat_bit_v);
+            let lspat_shifted = b.ins().ushr(lspattern_v, pat_bit32);
+            let bit_v  = b.ins().band_imm(lspat_shifted, 1);
+            let bit_set = b.ins().icmp_imm(IntCC::NotEqual, bit_v, 0);
+            b.ins().brif(bit_set, ls_pass, &[cur_use_bg], ls_block, &[]);
+            b.switch_to_block(ls_block); b.seal_block(ls_block);
+            if dm0.lsopaque() {
+                let bg1 = b.ins().iconst(types::I8, 1);
+                b.ins().jump(ls_pass, &[bg1]);
+            } else {
+                b.ins().jump(skip_block, &[]);
+            }
+            b.switch_to_block(ls_pass); b.seal_block(ls_pass);
+            cur_use_bg = b.block_params(ls_pass).to_vec()[0];
+        }
+
+        b.ins().jump(draw_block, &[cur_use_bg]);
+        b.switch_to_block(draw_block); b.seal_block(draw_block);
+        let use_bg_flag = b.block_params(draw_block).to_vec()[0];
+        let use_bg_bool = b.ins().icmp_imm(IntCC::NotEqual, use_bg_flag, 0);
+        b.ins().select(use_bg_bool, colorback_v, raw_src)
     };
-
-    // Pattern check: may replace raw_src with colorback (zpopaque/lsopaque)
-    // or skip pixel entirely. We emit conditional branches.
-    // draw_block takes use_bg_flag as a block param so each predecessor can
-    // pass the correct value without SSA dominance violations.
-    let draw_block = b.create_block();
-    b.append_block_param(draw_block, types::I8); // use_bg_flag
-
-    // Current use_bg value from the pre-pattern context (always 0 at entry).
-    let mut cur_use_bg: Value = b.ins().iconst(types::I8, 0);
-
-    if dm0.enzpattern() {
-        let zp_block = b.create_block();
-        let zp_pass  = b.create_block();
-        b.append_block_param(zp_pass, types::I8); // use_bg carried through
-        let zpattern_v = ld32!(ctx_off!(zpattern));
-        let zpat_bit32 = b.ins().uextend(types::I32, zpat_bit_v);
-        let zpat_shifted = b.ins().ushr(zpattern_v, zpat_bit32);
-        let bit_v = b.ins().band_imm(zpat_shifted, 1);
-        let bit_set = b.ins().icmp_imm(IntCC::NotEqual, bit_v, 0);
-        b.ins().brif(bit_set, zp_pass, &[cur_use_bg], zp_block, &[]);
-        b.switch_to_block(zp_block); b.seal_block(zp_block);
-        if dm0.zpopaque() {
-            let bg1 = b.ins().iconst(types::I8, 1);
-            b.ins().jump(zp_pass, &[bg1]);
-        } else {
-            b.ins().jump(skip_block, &[]);
-        }
-        b.switch_to_block(zp_pass); b.seal_block(zp_pass);
-        cur_use_bg = b.block_params(zp_pass).to_vec()[0];
-    }
-
-    if dm0.enlspattern() {
-        let ls_block = b.create_block();
-        let ls_pass  = b.create_block();
-        b.append_block_param(ls_pass, types::I8); // use_bg carried through
-        let lspattern_v = ld32!(ctx_off!(lspattern));
-        let pat_bit32 = b.ins().uextend(types::I32, pat_bit_v);
-        let lspat_shifted = b.ins().ushr(lspattern_v, pat_bit32);
-        let bit_v = b.ins().band_imm(lspat_shifted, 1);
-        let bit_set = b.ins().icmp_imm(IntCC::NotEqual, bit_v, 0);
-        b.ins().brif(bit_set, ls_pass, &[cur_use_bg], ls_block, &[]);
-        b.switch_to_block(ls_block); b.seal_block(ls_block);
-        if dm0.lsopaque() {
-            let bg1 = b.ins().iconst(types::I8, 1);
-            b.ins().jump(ls_pass, &[bg1]);
-        } else {
-            b.ins().jump(skip_block, &[]);
-        }
-        b.switch_to_block(ls_pass); b.seal_block(ls_pass);
-        cur_use_bg = b.block_params(ls_pass).to_vec()[0];
-    }
-
-    b.ins().jump(draw_block, &[cur_use_bg]);
-    b.switch_to_block(draw_block); b.seal_block(draw_block);
-    let use_bg_flag = b.block_params(draw_block).to_vec()[0];
-
-    // Actual source: use_bg ? colorback : raw_src
-    let use_bg_bool = b.ins().icmp_imm(IntCC::NotEqual, use_bg_flag, 0);
-    let src_color = b.ins().select(use_bg_bool, colorback_v, raw_src);
 
     emit_pixel_write(&mut b, px_ptr, x_bayer, y_bayer, src_color, &pctx, &mem, &memv, dm1);
     b.ins().jump(skip_block, &[]);

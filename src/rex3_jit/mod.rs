@@ -20,13 +20,36 @@ use std::sync::{Arc, RwLock};
 use std::sync::mpsc::{self, SyncSender};
 use std::thread;
 
+#[cfg(feature = "developer")]
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrd};
+
 use crate::rex3::Rex3Context;
 use compiler::ShaderCompiler;
 
-/// A compiled draw shader.
+/// A compiled draw shader and its housekeeping metadata.
 pub struct CompiledShader {
     /// `extern "C" fn(ctx: *mut Rex3Context, fb_rgb: *mut u32, fb_aux: *mut u32)`
     pub entry: unsafe extern "C" fn(*mut Rex3Context, *mut u32, *mut u32),
+    /// Size of the compiled native code in bytes (from Cranelift code_buffer).
+    pub code_bytes: u32,
+    /// Disabled at runtime via `rex jit disable` — lookup returns None, interpreter is used.
+    /// Stored here instead of a separate HashSet so the flag lives with the shader.
+    pub disabled: bool,
+    /// Number of times this shader was selected for dispatch (developer builds only).
+    #[cfg(feature = "developer")]
+    pub hit_count: AtomicU64,
+}
+
+impl CompiledShader {
+    fn new(entry: unsafe extern "C" fn(*mut Rex3Context, *mut u32, *mut u32), code_bytes: u32) -> Self {
+        Self {
+            entry,
+            code_bytes,
+            disabled: false,
+            #[cfg(feature = "developer")]
+            hit_count: AtomicU64::new(0),
+        }
+    }
 }
 
 // Safety: the entry pointer is a compiled native function, valid for the lifetime of the
@@ -41,8 +64,6 @@ pub struct ShaderStore {
     pub queued: RwLock<HashSet<(u32, u32)>>,
     /// Set of keys that failed to compile — never retried.
     pub failed: RwLock<HashSet<(u32, u32)>>,
-    /// Set of keys manually disabled via `rex jit disable` — bypassed to interpreter.
-    pub disabled: RwLock<HashSet<(u32, u32)>>,
 }
 
 impl ShaderStore {
@@ -51,7 +72,6 @@ impl ShaderStore {
             cache: RwLock::new(HashMap::new()),
             queued: RwLock::new(HashSet::new()),
             failed: RwLock::new(HashSet::new()),
-            disabled: RwLock::new(HashSet::new()),
         }
     }
 }
@@ -88,15 +108,16 @@ impl RexJit {
                     match req {
                         CompileRequest::Compile(dm0, dm1) => {
                             match compiler.compile_shader(dm0, dm1) {
-                                Some(entry) => {
-                                    let shader = CompiledShader { entry };
+                                Some((entry, code_bytes)) => {
+                                    let shader = CompiledShader::new(entry, code_bytes);
                                     let count = {
                                         let mut cache = store_clone.cache.write().unwrap();
                                         cache.insert((dm0, dm1), shader);
                                         cache.len()
                                     };
                                     store_clone.queued.write().unwrap().remove(&(dm0, dm1));
-                                    eprintln!("REX JIT: compiled dm0={dm0:#010x} dm1={dm1:#010x} (total: {count})");
+                                    eprintln!("REX JIT: compiled dm0={dm0:#010x} dm1={dm1:#010x} \
+                                        ({code_bytes}B, total: {count})");
                                 }
                                 None => {
                                     // Compilation failed or not JIT-able; mark as permanently
@@ -140,39 +161,60 @@ impl RexJit {
     pub fn lookup(&self, dm0: u32, dm1: u32)
         -> Option<unsafe extern "C" fn(*mut Rex3Context, *mut u32, *mut u32)>
     {
-        if self.store.disabled.read().unwrap().contains(&(dm0, dm1)) {
+        let cache = self.store.cache.read().unwrap();
+        let shader = cache.get(&(dm0, dm1))?;
+        if shader.disabled {
             return None;
         }
-        let cache = self.store.cache.read().unwrap();
-        cache.get(&(dm0, dm1)).map(|s| s.entry)
+        #[cfg(feature = "developer")]
+        shader.hit_count.fetch_add(1, AtomicOrd::Relaxed);
+        Some(shader.entry)
     }
 
     /// Disable a specific compiled shader (force interpreter fallback).
     pub fn disable_shader(&self, dm0: u32, dm1: u32) {
-        self.store.disabled.write().unwrap().insert((dm0, dm1));
+        if let Some(shader) = self.store.cache.write().unwrap().get_mut(&(dm0, dm1)) {
+            shader.disabled = true;
+        }
     }
 
     /// Re-enable a previously disabled shader.
     pub fn enable_shader(&self, dm0: u32, dm1: u32) {
-        self.store.disabled.write().unwrap().remove(&(dm0, dm1));
+        if let Some(shader) = self.store.cache.write().unwrap().get_mut(&(dm0, dm1)) {
+            shader.disabled = false;
+        }
     }
 
-    /// Return info about all known shaders: (dm0, dm1, status) where status is
-    /// "compiled", "disabled", "failed", or "queued".
-    pub fn shader_list(&self) -> Vec<(u32, u32, &'static str)> {
-        let cache    = self.store.cache.read().unwrap();
-        let disabled = self.store.disabled.read().unwrap();
-        let failed   = self.store.failed.read().unwrap();
-        let queued   = self.store.queued.read().unwrap();
+    /// Return info about all known shaders for `rex jit list` / `rex jit status`.
+    /// Fields: (dm0, dm1, status, code_bytes, hit_count)
+    /// status: "compiled" | "disabled" | "failed" | "queued"
+    pub fn shader_list(&self) -> Vec<ShaderInfo> {
+        let cache  = self.store.cache.read().unwrap();
+        let failed = self.store.failed.read().unwrap();
+        let queued = self.store.queued.read().unwrap();
+
         let mut all: std::collections::BTreeSet<(u32, u32)> = cache.keys().copied().collect();
         all.extend(failed.iter().copied());
         all.extend(queued.iter().copied());
+
         all.into_iter().map(|(dm0, dm1)| {
-            let status = if disabled.contains(&(dm0, dm1)) { "disabled" }
-                else if failed.contains(&(dm0, dm1))       { "failed" }
-                else if queued.contains(&(dm0, dm1))       { "queued" }
-                else                                       { "compiled" };
-            (dm0, dm1, status)
+            if let Some(s) = cache.get(&(dm0, dm1)) {
+                ShaderInfo {
+                    dm0, dm1,
+                    status: if s.disabled { "disabled" } else { "compiled" },
+                    code_bytes: s.code_bytes,
+                    #[cfg(feature = "developer")]
+                    hit_count: s.hit_count.load(AtomicOrd::Relaxed),
+                }
+            } else {
+                ShaderInfo {
+                    dm0, dm1,
+                    status: if failed.contains(&(dm0, dm1)) { "failed" } else { "queued" },
+                    code_bytes: 0,
+                    #[cfg(feature = "developer")]
+                    hit_count: 0,
+                }
+            }
         }).collect()
     }
 
@@ -246,6 +288,19 @@ impl RexJit {
         pairs.sort();
         pairs
     }
+}
+
+/// Per-shader info returned by `shader_list()`.
+pub struct ShaderInfo {
+    pub dm0: u32,
+    pub dm1: u32,
+    /// "compiled" | "disabled" | "failed" | "queued"
+    pub status: &'static str,
+    /// Compiled native code size in bytes (0 for failed/queued).
+    pub code_bytes: u32,
+    /// Times this shader was dispatched (developer builds only).
+    #[cfg(feature = "developer")]
+    pub hit_count: u64,
 }
 
 impl Drop for RexJit {
