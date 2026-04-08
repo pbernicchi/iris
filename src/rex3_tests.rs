@@ -2445,6 +2445,55 @@ mod jit_tests {
         );
     }
 
+    /// Exact triangle draw mode from simple GL test: ENZPAT + SHADE + LRONLY + CICLAMP + LEN32.
+    /// dm0=0x002c9126, dm1=0x3009f009 (RGB 8bpp dither SRC).
+    /// Uses zpattern=0xffffff00 (24 on, 8 off).
+    #[test]
+    fn jit_triangle_exact_mode() {
+        let dm0 = 0x002c9126u32;
+        let dm1 = 0x3009f009u32;
+        compare_jit_interp(0, 0, 32, 0,
+            |rex| {
+                reg(rex, REX3_DRAWMODE1,  dm1);
+                reg(rex, REX3_WRMASK,     0xFF);
+                reg(rex, REX3_ZPATTERN,   0xffffff00);
+                reg(rex, REX3_COLORRED,   0u32);
+                reg(rex, REX3_COLORGRN,   0u32);
+                reg(rex, REX3_COLORBLUE,  0x7fffff_u32); // near-max blue
+                reg(rex, REX3_SLOPERED,   2u32 << 11);
+                reg(rex, REX3_SLOPEGRN,   1u32 << 11);
+                reg(rex, REX3_SLOPEBLUE,  0x8000_0800u32); // -1<<11
+                reg(rex, REX3_XYSTARTI,   xy(0, 0));
+                reg(rex, REX3_XYENDI,     xy(32, 0));
+            },
+            dm0, dm1,
+        );
+    }
+
+    /// Multi-row block with STOPONY — tests that shade state persists correctly row-to-row.
+    /// dm0=0x002e0126: same as octa shade but with STOPONY added (bit 9).
+    #[test]
+    fn jit_shade_rgb12_dither_block_multirow() {
+        let dm0 = 0x002e0126u32; // DRAW BLOCK DOSETUP STOPONX STOPONY ENZPAT LRONLY CICLAMP SHADE
+        let dm1 = 0x3009f011u32;
+        compare_jit_interp(5, 5, 20, 10,
+            |rex| {
+                reg(rex, REX3_DRAWMODE1, dm1);
+                reg(rex, REX3_WRMASK,    0xFFFFFF);
+                reg(rex, REX3_ZPATTERN,  0xFFFFFFFF); // all-on, no masking
+                reg(rex, REX3_COLORRED,  0x80u32 << 11);
+                reg(rex, REX3_COLORGRN,  0x20u32 << 11);
+                reg(rex, REX3_COLORBLUE, 0x10u32 << 11);
+                reg(rex, REX3_SLOPERED,  3u32 << 11);
+                reg(rex, REX3_SLOPEGRN,  2u32 << 11);
+                reg(rex, REX3_SLOPEBLUE, 1u32 << 11);
+                reg(rex, REX3_XYENDI,    xy(20, 10));
+                reg(rex, REX3_XYSTARTI,  xy(5, 5));
+            },
+            dm0, dm1,
+        );
+    }
+
     /// LRONLY block: pixels skipped when x_dec=1 (right-to-left), shade always advances.
     /// Set x_dec=1 by making xend < xstart (decreasing x direction).
     #[test]

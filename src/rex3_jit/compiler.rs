@@ -566,20 +566,26 @@ fn emit_shader(
     let first_init  = b.ins().iconst(types::I8, 1);
 
     // length32: stop after 32 pixels if span_len >= 32.
-    // xstop = xstart + (32<<11), only active for span mode + length32 + span_len>=32.
-    // Computed once at shader entry; carried as a local (not a loop param — it's invariant).
-    // Emit as an Option<Value>: Some(xstop_val) when length32 is set and not a block.
-    let xstop_v: Option<Value> = if dm0.length32() && !is_block {
-        let c32_11 = b.ins().iconst(types::I32, 32 << 11);
-        let xstop_raw = b.ins().iadd(xstart_init, c32_11);
-        // Only use xstop when span_len >= 32: span_len = (xend - xstart) >> 11
+    // xstop = xstart ± (32<<11) depending on direction.
+    // Computed once at shader entry; used in cont_x_block to stop the loop early.
+    let xstop_v: Option<Value> = if dm0.length32() {
+        let c32_11_pos = b.ins().iconst(types::I32,  32 << 11);
+        let c32_11_neg = b.ins().iconst(types::I32, -(32i64 << 11));
+        let step32 = b.ins().select(x_dec_v, c32_11_neg, c32_11_pos);
+        let xstop_raw = b.ins().iadd(xstart_init, step32);
+        // Only activate when span_len >= 32: span_len = abs(xend - xstart) >> 11
         let diff = b.ins().isub(xend_v, xstart_init);
-        let span_len_v = b.ins().sshr_imm(diff, 11);
+        let diff_abs = {
+            let neg = b.ins().ineg(diff);
+            let is_neg = b.ins().icmp_imm(IntCC::SignedLessThan, diff, 0);
+            b.ins().select(is_neg, neg, diff)
+        };
+        let span_len_v = b.ins().ushr_imm(diff_abs, 11);
         let c32i = b.ins().iconst(types::I32, 32);
-        let long_enough = b.ins().icmp(IntCC::SignedGreaterThanOrEqual, span_len_v, c32i);
-        // Select: if span_len >= 32 use xstop_raw, else use xend_v+1 (unreachable limit)
-        let xend_plus1 = b.ins().iadd_imm(xend_v, 1 << 11); // beyond xend → never triggers
-        Some(b.ins().select(long_enough, xstop_raw, xend_plus1))
+        let long_enough = b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, span_len_v, c32i);
+        // If span < 32: use a sentinel that never triggers (xend ± 1 step beyond)
+        let never = b.ins().iadd(xend_v, step32);
+        Some(b.ins().select(long_enough, xstop_raw, never))
     } else {
         None
     };
@@ -1257,8 +1263,10 @@ fn emit_shader(
         if dm0.enlspattern() { back_args.push(new_pat_bit); back_args.push(new_lsmode); }
 
         if let Some(xstop) = xstop_v {
-            // length32: stop if xstart_next >= xstop
-            let at_xstop = b.ins().icmp(IntCC::SignedGreaterThanOrEqual, xstart_next, xstop);
+            // length32: stop if xstart_next >= xstop (x_inc) or <= xstop (x_dec)
+            let at_xstop_inc = b.ins().icmp(IntCC::SignedGreaterThanOrEqual, xstart_next, xstop);
+            let at_xstop_dec = b.ins().icmp(IntCC::SignedLessThanOrEqual,    xstart_next, xstop);
+            let at_xstop = b.ins().select(x_dec_v, at_xstop_dec, at_xstop_inc);
             let xstop_block = b.create_block();
             let keep_going  = b.create_block();
             b.ins().brif(at_xstop, xstop_block, &[], keep_going, &[]);

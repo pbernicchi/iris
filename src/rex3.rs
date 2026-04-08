@@ -564,6 +564,7 @@ fn to_color(val: u32) -> u32 {
 
 fn from_slope_red(val: u32) -> i32 {
     let mag = val & 0x7FFFFF;
+    if mag == 0 { return 0; } // negative-zero: sign bit set but magnitude zero → treat as 0
     let result = if val & 0x80000000 != 0 {
         // Negative: two's complement of magnitude, keep bit23 as sign
         (0x00800000u32.wrapping_sub(mag) | 0x00800000) as i32
@@ -580,6 +581,7 @@ fn to_slope_red(val: i32) -> u32 {
 
 fn from_slope(val: u32) -> i32 {
     let mag = val & 0x7FFFF;
+    if mag == 0 { return 0; } // negative-zero → treat as 0
     let result = if val & 0x80000000 != 0 {
         (0x00080000u32.wrapping_sub(mag) | 0x00080000) as i32
     } else {
@@ -1618,11 +1620,10 @@ impl Rex3 {
 
     #[inline(always)]
     fn shade_add(ctx: &mut Rex3Context) {
-        // Slope is sign-extended 24/20-bit two's-complement stored as i32.
-        if ctx.slopered  & 0x7FFFFF != 0 { ctx.colorred   = ctx.colorred.wrapping_add(ctx.slopered  as u32); }
-        if ctx.slopegrn  & 0x7FFFF  != 0 { ctx.colorgrn   = ctx.colorgrn.wrapping_add(ctx.slopegrn  as u32); }
-        if ctx.slopeblue & 0x7FFFF  != 0 { ctx.colorblue  = ctx.colorblue.wrapping_add(ctx.slopeblue as u32); }
-        if ctx.slopealpha & 0x7FFFF != 0 { ctx.coloralpha = ctx.coloralpha.wrapping_add(ctx.slopealpha as u32); }
+        ctx.colorred   = ctx.colorred.wrapping_add(ctx.slopered   as u32);
+        ctx.colorgrn   = ctx.colorgrn.wrapping_add(ctx.slopegrn   as u32);
+        ctx.colorblue  = ctx.colorblue.wrapping_add(ctx.slopeblue  as u32);
+        ctx.coloralpha = ctx.coloralpha.wrapping_add(ctx.slopealpha as u32);
     }
 
     fn iterate_shade_noop(_ctx: &mut Rex3Context) {}
