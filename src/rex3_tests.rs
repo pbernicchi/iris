@@ -2494,4 +2494,182 @@ mod jit_tests {
             dm0, dm1,
         );
     }
+
+    /// Timing comparison: full-screen Gouraud-shaded fill, interpreter vs JIT.
+    ///
+    /// Matches what IRIX actually does: one SPAN GO per scanline (STOPONX, no STOPONY),
+    /// color and XYSTARTI/XYENDI set per line, slope constant across the frame.
+    /// All scanlines are pushed into the GFIFO without waiting between them; a single
+    /// wait_idle() at the end drains the queue.  This measures pure shader throughput
+    /// rather than GFIFO round-trip latency.
+    ///
+    /// Not a correctness test — always passes — output visible with `--nocapture`.
+    #[test]
+    fn jit_timing_shade_scanlines_fullscreen() {
+        const ITERS: u32 = 20;
+        const W: i32     = 1279;
+        const H: i32     = 1023;
+
+        // SPAN, SHADE, STOPONX (no STOPONY — each GO is exactly one scanline)
+        let dm1 = DM1_RGB24_SRC;
+        let dm0 = DM0_DRAW_SPAN | (1 << 18); // shade, stoponx already in DM0_DRAW_SPAN
+
+        // Helper: push ITERS full screens as back-to-back scanline GOs, return elapsed nanos.
+        // dm1/wrmask/slopes are constant; only colorRGB and xystarti/xyendi change per line.
+        let run = |rex: &Rex3| -> u64 {
+            reg(rex, REX3_DRAWMODE1,  dm1);
+            reg(rex, REX3_WRMASK,     0xFFFFFF);
+            reg(rex, REX3_SLOPERED,   2u32 << 11);
+            reg(rex, REX3_SLOPEGRN,   1u32 << 11);
+            reg(rex, REX3_SLOPEBLUE,  0);
+
+            let start = std::time::Instant::now();
+            for i in 0..ITERS {
+                let r0 = ((i * 7) % 200) as u32; // vary per frame to prevent dead-code elision
+                let g0 = ((i * 3) % 180) as u32;
+                let b0 = ((i * 5) % 160) as u32;
+                for y in 0..=H {
+                    reg(rex, REX3_COLORRED,   r0 << 11);
+                    reg(rex, REX3_COLORGRN,   g0 << 11);
+                    reg(rex, REX3_COLORBLUE,  b0 << 11);
+                    reg(rex, REX3_XYENDI,     xy(W, y));
+                    // XYSTARTI+GO in one write — triggers the draw
+                    rex.write32(go_addr(REX3_XYSTARTI), xy(0, y));
+                }
+                // Drain after each full frame so we measure throughput not queue depth
+                rex.wait_idle();
+            }
+            start.elapsed().as_nanos() as u64
+        };
+
+        // ── interpreter run ───────────────────────────────────────────────────
+        let rex_interp = make_rex3();
+        rex3init(rex_interp);
+        let interp_ns = run(rex_interp);
+
+        // ── JIT run: trigger compile on first scanline, wait, then run timed loop ──
+        let rex_jit = make_rex3_jit();
+        rex3init(rex_jit);
+        reg(rex_jit, REX3_DRAWMODE1,  dm1);
+        reg(rex_jit, REX3_WRMASK,     0xFFFFFF);
+        reg(rex_jit, REX3_SLOPERED,   2u32 << 11);
+        reg(rex_jit, REX3_SLOPEGRN,   1u32 << 11);
+        reg(rex_jit, REX3_SLOPEBLUE,  0);
+        reg(rex_jit, REX3_COLORRED,   0u32);
+        reg(rex_jit, REX3_COLORGRN,   0u32);
+        reg(rex_jit, REX3_COLORBLUE,  0u32);
+        reg(rex_jit, REX3_XYENDI,     xy(W, 0));
+        reg_go(rex_jit, REX3_XYSTARTI, xy(0, 0)); // triggers compile request
+        // Spin until compiled — re-request each iteration in case the channel was full
+        // (profile warm-up can fill the 256-entry sync_channel on first boot).
+        if let Some(ref jit) = rex_jit.rex_jit {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                if jit.compiled_pairs().contains(&(dm0, dm1)) { break; }
+                assert!(std::time::Instant::now() < deadline,
+                    "JIT compile timed out for dm0={dm0:#010x} dm1={dm1:#010x}");
+                jit.request_compile(dm0, dm1); // retry if channel was full
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+        let jit_ns = run(rex_jit);
+
+        let px_per_iter   = (W as u64 + 1) * (H as u64 + 1);
+        let interp_mpx    = px_per_iter * ITERS as u64 * 1000 / interp_ns.max(1);
+        let jit_mpx       = px_per_iter * ITERS as u64 * 1000 / jit_ns.max(1);
+        let speedup_raw   = interp_ns as f64 / jit_ns.max(1) as f64;
+
+        println!(
+            "\n=== JIT timing: {} frames of {}×{} Gouraud-shade scanline fill ===\
+             \n  Interpreter : {:>8} ms  ({:>6} Mpx/s)\
+             \n  JIT         : {:>8} ms  ({:>6} Mpx/s)\
+             \n  Speedup     : {:.2}x (JIT is {})\n",
+            ITERS, W + 1, H + 1,
+            interp_ns / 1_000_000, interp_mpx,
+            jit_ns    / 1_000_000, jit_mpx,
+            speedup_raw.max(1.0 / speedup_raw.max(f64::EPSILON)),
+            if speedup_raw >= 1.0 { "faster" } else { "slower" },
+        );
+    }
+
+    /// Verify Gouraud interpolation pixel-by-pixel: R ramps from 255 down to 0 across 256 pixels.
+    ///
+    /// slope = (0 - 255) / 255 = -1 per pixel = -1 << 11 in o12.11 fixed-point.
+    /// colorred_start = 255 << 11.
+    /// Expected fb[x] red channel = 255 - x  for x in 0..=255, then 0 for x > 255.
+    ///
+    /// Tests both interpreter and JIT paths and prints pixel values on mismatch.
+    #[test]
+    fn jit_shade_ramp_255_to_0() {
+        // dm0: DRAW SPAN STOPONX SHADE
+        let dm0 = DM0_DRAW_SPAN | (1 << 18);
+        let dm1 = DM1_RGB24_SRC;
+
+        // slope = -1 per pixel = -1 in integer part = -1 << 11 in o12.11
+        // from_slope_red: negative slope written as 0x80000000 | magnitude
+        // magnitude of -1<<11 = 2048 = 0x800
+        let slope_neg1: u32 = 0x8000_0800; // -1 << 11
+
+        let check = |rex: &Rex3, label: &str| {
+            reg(rex, REX3_DRAWMODE0,  dm0);
+            reg(rex, REX3_DRAWMODE1,  dm1);
+            reg(rex, REX3_WRMASK,     0xFFFFFF);
+            reg(rex, REX3_COLORRED,   255u32 << 11);
+            reg(rex, REX3_COLORGRN,   0u32);
+            reg(rex, REX3_COLORBLUE,  0u32);
+            reg(rex, REX3_SLOPERED,   slope_neg1);
+            reg(rex, REX3_SLOPEGRN,   0);
+            reg(rex, REX3_SLOPEBLUE,  0);
+            reg(rex, REX3_XYENDI,     xy(255, 0));
+            reg_go(rex, REX3_XYSTARTI, xy(0, 0));
+
+            let mut failed = false;
+            for x in 0..=255i32 {
+                let px   = read_pixel(rex, x, 0);
+                let r    = px & 0xFF;
+                let expected = (255 - x) as u32;
+                if r != expected {
+                    if !failed {
+                        println!("{label}: ramp mismatch (first 8 errors):");
+                        failed = true;
+                    }
+                    println!("  x={x:3}: got r={r:#04x} ({r}), expected {expected:#04x} ({expected})");
+                }
+            }
+            assert!(!failed, "{label}: ramp 255→0 failed");
+        };
+
+        // Interpreter
+        let rex_i = make_rex3();
+        rex3init(rex_i);
+        check(rex_i, "interp");
+
+        // JIT
+        let rex_j = make_rex3_jit();
+        rex3init(rex_j);
+        // First draw triggers compile + interp fallback; wait then re-draw
+        reg(rex_j, REX3_DRAWMODE0,  dm0);
+        reg(rex_j, REX3_DRAWMODE1,  dm1);
+        reg(rex_j, REX3_WRMASK,     0xFFFFFF);
+        reg(rex_j, REX3_COLORRED,   255u32 << 11);
+        reg(rex_j, REX3_COLORGRN,   0u32);
+        reg(rex_j, REX3_COLORBLUE,  0u32);
+        reg(rex_j, REX3_SLOPERED,   slope_neg1);
+        reg(rex_j, REX3_SLOPEGRN,   0);
+        reg(rex_j, REX3_SLOPEBLUE,  0);
+        reg(rex_j, REX3_XYENDI,     xy(255, 0));
+        reg_go(rex_j, REX3_XYSTARTI, xy(0, 0));
+        if let Some(ref jit) = rex_j.rex_jit {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                if jit.compiled_pairs().contains(&(dm0, dm1)) { break; }
+                assert!(std::time::Instant::now() < deadline, "JIT compile timeout");
+                jit.request_compile(dm0, dm1);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+        // Clear and re-run via JIT
+        for x in 0..=255i32 { unsafe { (*rex_j.fb_rgb.get())[(x as u32) as usize] = 0; } }
+        check(rex_j, "jit");
+    }
 }

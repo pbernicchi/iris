@@ -931,6 +931,10 @@ pub struct Rex3 {
     /// Whether the JIT is enabled for dispatch (can be toggled at runtime via `rex jit on/off`).
     #[cfg(feature = "rex-jit")]
     pub jit_enabled: AtomicBool,
+    /// Last-hit JIT shader cache: avoids HashMap lookup when (dm0, dm1) is the same as
+    /// the previous GO.  Only accessed from the GFIFO consumer thread — no sync needed.
+    #[cfg(feature = "rex-jit")]
+    pub jit_last: std::cell::Cell<(u32, u32, Option<unsafe extern "C" fn(*mut Rex3Context, *mut u32, *mut u32)>)>,
     /// Shared activity heartbeat — set by all devices, polled+cleared by the refresh thread.
     /// bit 0 = enet TX, bit 1 = enet RX, bits 2-3 = red/green LED (persistent), bits 8-13 = SCSI IDs 0-5
     pub heartbeat: Arc<AtomicU64>,
@@ -1063,6 +1067,8 @@ impl Rex3 {
             rex_jit: Some(std::sync::Arc::new(crate::rex3_jit::RexJit::new())),
             #[cfg(feature = "rex-jit")]
             jit_enabled: AtomicBool::new(true),
+            #[cfg(feature = "rex-jit")]
+            jit_last: std::cell::Cell::new((0, 0, None)),
             heartbeat,
             cycles,
             fasttick_count,
@@ -3019,17 +3025,28 @@ impl Rex3 {
                     && !ctx.drawmode0.colorhost()
                     && !ctx.drawmode0.alphahost();
                 if is_jittable {
-                    if let Some(entry) = jit.lookup(dm0, dm1) {
+                    // Fast path: same (dm0, dm1) as last GO — skip the HashMap lookup.
+                    // Last-hit cache: skip HashMap lookup when (dm0,dm1) unchanged.
+                    // Only cache hits (Some); misses re-lookup every GO so a freshly
+                    // compiled shader is picked up immediately without extra plumbing.
+                    let last = self.jit_last.get();
+                    let entry = if last.0 == dm0 && last.1 == dm1 && last.2.is_some() {
+                        last.2
+                    } else {
+                        let e = jit.lookup(dm0, dm1);
+                        if let Some(_) = e { self.jit_last.set((dm0, dm1, e)); }
+                        else { jit.request_compile(dm0, dm1); }
+                        e
+                    };
+                    if let Some(entry) = entry {
                         let fb_rgb = unsafe { (*self.fb_rgb.get()).as_mut_ptr() };
                         let fb_aux = unsafe { (*self.fb_aux.get()).as_mut_ptr() };
                         unsafe { entry(ctx as *mut Rex3Context, fb_rgb, fb_aux); }
                         self.jit_go_count.fetch_add(1, Ordering::Relaxed);
                         self.diag.fetch_and(!Self::DIAG_LOOP_EXECUTE_GO, Ordering::Relaxed);
                         return;
-                    } else {
-                        jit.request_compile(dm0, dm1);
-                        // fall through to interpreter
                     }
+                    // fall through to interpreter
                 }
             }
             } // jit_enabled
@@ -3772,6 +3789,7 @@ impl Device for Rex3 {
                 Some("on") | Some("off") => {
                     let val = args[1] == "on";
                     self.jit_enabled.store(val, Ordering::Relaxed);
+                    self.jit_last.set((0, 0, None));
                     writeln!(writer, "REX JIT dispatch: {}", if val { "enabled" } else { "disabled" }).unwrap();
                 }
                 Some("list") => {
@@ -3799,6 +3817,8 @@ impl Device for Rex3 {
                         .map_err(|_| format!("bad dm1: {dm1_s}"))?;
                     if let Some(ref jit) = self.rex_jit {
                         if enable { jit.enable_shader(dm0, dm1); } else { jit.disable_shader(dm0, dm1); }
+                        // Invalidate last-hit cache so the change takes effect immediately.
+                        self.jit_last.set((0, 0, None));
                         writeln!(writer, "Shader dm0={dm0:#010x} dm1={dm1:#010x}: {}",
                             if enable { "enabled" } else { "disabled" }).unwrap();
                     }
