@@ -183,6 +183,304 @@ impl ShaderCompiler {
 
 // ── Shader IR emission ────────────────────────────────────────────────────────
 
+/// Loop-invariant ctx values needed by address calculation and pixel write.
+struct PixelCtx {
+    xywin_v:     Value, // packed: hi=xwin, lo=ywin
+    xymove_v:    Value,
+    clipmode_v:  Value,
+    wrmask_v:    Value,
+    colorback_v: Value,
+    colorvram_v: Value,
+    smask0x_v:   Value,
+    smask0y_v:   Value,
+    smask1x_v:   Value,
+    smask1y_v:   Value,
+    smask2x_v:   Value,
+    smask2y_v:   Value,
+    smask3x_v:   Value,
+    smask3y_v:   Value,
+    smask4x_v:   Value,
+    smask4y_v:   Value,
+    fb_rgb:      Value, // ptr
+    fb_aux:      Value, // ptr
+}
+
+/// Mirrors Rex3::calculate_fb_address.
+/// Emits xymove, xywin, smask clipping, bounds check.
+/// On clip/OOB miss: branches to `skip_block`.
+/// On hit: falls through to a new `in_bounds` block and returns `(px_ptr, x_bayer, y_bayer)`.
+/// `x_bayer`/`y_bayer` are the window-relative coords (before xywin bias) — used for dither packing.
+fn emit_calculate_fb_address(
+    b:          &mut FunctionBuilder,
+    x_v:        Value,
+    y_v:        Value,
+    pctx:       &PixelCtx,
+    skip_block: ir::Block,
+    dm0:        &Dm0,
+    dm1:        &Dm1,
+    coord_bias: Value,
+    c0:         Value,
+    c2048:      Value,
+    ptr_type:   ir::Type,
+) -> (Value, Value, Value) { // (px_ptr, x_bayer, y_bayer)
+    // 1. Apply xymove (only for fb address, not for source address)
+    let (x_curr, y_curr) = if dm0.xyoffset() {
+        let xm_raw = b.ins().ushr_imm(pctx.xymove_v, 16);
+        let xm16   = b.ins().ireduce(types::I16, xm_raw);
+        let xm32   = b.ins().sextend(types::I32, xm16);
+        let ym_raw = b.ins().band_imm(pctx.xymove_v, 0xFFFF_i64);
+        let ym16   = b.ins().ireduce(types::I16, ym_raw);
+        let ym32   = b.ins().sextend(types::I32, ym16);
+        (b.ins().iadd(x_v, xm32), b.ins().iadd(y_v, ym32))
+    } else {
+        (x_v, y_v)
+    };
+
+    // 2. Apply xywin to get screen-absolute coords
+    let xw_raw = b.ins().ushr_imm(pctx.xywin_v, 16);
+    let xw16   = b.ins().ireduce(types::I16, xw_raw);
+    let xw32   = b.ins().sextend(types::I32, xw16);
+    let yw_raw = b.ins().band_imm(pctx.xywin_v, 0xFFFF_i64);
+    let yw16   = b.ins().ireduce(types::I16, yw_raw);
+    let yw32   = b.ins().sextend(types::I32, yw16);
+    let x_abs  = b.ins().iadd(x_curr, xw32);
+    let y_abs  = b.ins().iadd(y_curr, yw32);
+
+    // 3. Scissor / smask clipping
+    let after_clip = b.create_block();
+    {
+        let ensmask = b.ins().band_imm(pctx.clipmode_v, 0x1F_i64);
+        // smask0: window-relative
+        let bit0 = b.ins().band_imm(ensmask, 1);
+        let smask0_active = b.ins().icmp_imm(IntCC::NotEqual, bit0, 0);
+        let clip_check0 = b.create_block();
+        let pass0 = b.create_block();
+        b.ins().brif(smask0_active, clip_check0, &[], pass0, &[]);
+        b.switch_to_block(clip_check0); b.seal_block(clip_check0);
+        let sm0x_hi    = b.ins().ushr_imm(pctx.smask0x_v, 16);
+        let sm0x_hi16  = b.ins().ireduce(types::I16, sm0x_hi);
+        let min_x0     = b.ins().sextend(types::I32, sm0x_hi16);
+        let sm0x_lo16  = b.ins().ireduce(types::I16, pctx.smask0x_v);
+        let max_x0     = b.ins().sextend(types::I32, sm0x_lo16);
+        let sm0y_hi    = b.ins().ushr_imm(pctx.smask0y_v, 16);
+        let sm0y_hi16  = b.ins().ireduce(types::I16, sm0y_hi);
+        let min_y0     = b.ins().sextend(types::I32, sm0y_hi16);
+        let sm0y_lo16  = b.ins().ireduce(types::I16, pctx.smask0y_v);
+        let max_y0     = b.ins().sextend(types::I32, sm0y_lo16);
+        let ok0 = and4_range(b, x_curr, y_curr, min_x0, max_x0, min_y0, max_y0);
+        b.ins().brif(ok0, pass0, &[], skip_block, &[]);
+        b.switch_to_block(pass0); b.seal_block(pass0);
+
+        // smasks 1-4: screen-absolute, OR-combined (any enabled mask that contains the pixel passes)
+        let smask_hi  = b.ins().band_imm(ensmask, 0x1E_i64);
+        let any_smask = b.ins().icmp_imm(IntCC::NotEqual, smask_hi, 0);
+        let smask_check = b.create_block();
+        b.ins().brif(any_smask, smask_check, &[], after_clip, &[]);
+        b.switch_to_block(smask_check); b.seal_block(smask_check);
+        let mut inside_any: Value = b.ins().iconst(types::I8, 0);
+        for (sx, sy, bit_mask) in [
+            (pctx.smask1x_v, pctx.smask1y_v, 2i64),
+            (pctx.smask2x_v, pctx.smask2y_v, 4i64),
+            (pctx.smask3x_v, pctx.smask3y_v, 8i64),
+            (pctx.smask4x_v, pctx.smask4y_v, 16i64),
+        ] {
+            let bit     = b.ins().band_imm(ensmask, bit_mask);
+            let enabled = b.ins().icmp_imm(IntCC::NotEqual, bit, 0);
+            let sx_hi   = b.ins().ushr_imm(sx, 16);
+            let sx_hi16 = b.ins().ireduce(types::I16, sx_hi);
+            let min_x   = b.ins().sextend(types::I32, sx_hi16);
+            let sx_lo16 = b.ins().ireduce(types::I16, sx);
+            let max_x   = b.ins().sextend(types::I32, sx_lo16);
+            let sy_hi   = b.ins().ushr_imm(sy, 16);
+            let sy_hi16 = b.ins().ireduce(types::I16, sy_hi);
+            let min_y   = b.ins().sextend(types::I32, sy_hi16);
+            let sy_lo16 = b.ins().ireduce(types::I16, sy);
+            let max_y   = b.ins().sextend(types::I32, sy_lo16);
+            let in_range = and4_range(b, x_abs, y_abs, min_x, max_x, min_y, max_y);
+            let contrib  = b.ins().band(enabled, in_range);
+            inside_any   = b.ins().bor(inside_any, contrib);
+        }
+        let inside = b.ins().icmp_imm(IntCC::NotEqual, inside_any, 0);
+        b.ins().brif(inside, after_clip, &[], skip_block, &[]);
+    }
+    b.switch_to_block(after_clip); b.seal_block(after_clip);
+
+    // 4. Physical address
+    let y_phys = if dm1.yflip() {
+        let c23ff = b.ins().iconst(types::I32, 0x23FF);
+        b.ins().isub(c23ff, y_abs)
+    } else {
+        b.ins().isub(y_abs, coord_bias)
+    };
+    let x_phys = b.ins().isub(x_abs, coord_bias);
+
+    // Bounds check
+    let screen_w = b.ins().iconst(types::I32, REX3_SCREEN_WIDTH as i64);
+    let screen_h = b.ins().iconst(types::I32, REX3_SCREEN_HEIGHT as i64);
+    let oob = {
+        let xn = b.ins().icmp(IntCC::SignedLessThan, x_phys, c0);
+        let xw = b.ins().icmp(IntCC::SignedGreaterThanOrEqual, x_phys, screen_w);
+        let yn = b.ins().icmp(IntCC::SignedLessThan, y_phys, c0);
+        let yt = b.ins().icmp(IntCC::SignedGreaterThanOrEqual, y_phys, screen_h);
+        let ab = b.ins().bor(xn, xw);
+        let cd = b.ins().bor(yn, yt);
+        b.ins().bor(ab, cd)
+    };
+    let in_bounds = b.create_block();
+    b.ins().brif(oob, skip_block, &[], in_bounds, &[]);
+    b.switch_to_block(in_bounds); b.seal_block(in_bounds);
+
+    // Compute byte pointer into framebuffer
+    let ym2048    = b.ins().imul(y_phys, c2048);
+    let addr_i32  = b.ins().iadd(ym2048, x_phys);
+    let c4        = b.ins().iconst(types::I32, 4);
+    let byte_off  = b.ins().imul(addr_i32, c4);
+    let byte_off64 = b.ins().uextend(types::I64, byte_off);
+    let use_aux   = matches!(dm1.planes(),
+        p if p == DRAWMODE1_PLANES_OLAY || p == DRAWMODE1_PLANES_PUP || p == DRAWMODE1_PLANES_CID);
+    let fb_ptr    = if use_aux { pctx.fb_aux } else { pctx.fb_rgb };
+    let px_ptr    = b.ins().iadd(fb_ptr, byte_off64);
+    let _ptr_type = ptr_type; // consumed by caller if needed
+
+    (px_ptr, x_curr, y_curr)
+}
+
+/// Mirrors the inner body of Rex3::process_pixel_draw / process_pixel_fastclear
+/// after `calculate_fb_address` succeeds.
+/// `src_color`: already-resolved source (colorback substitution applied by caller).
+/// `x_bayer`/`y_bayer`: window-relative coords for dither index.
+/// Emits the fb read → fastclear/blend/logicop result → wrmask → store.
+fn emit_pixel_write(
+    b:           &mut FunctionBuilder,
+    px_ptr:      Value,
+    x_bayer:     Value,
+    y_bayer:     Value,
+    src_color:   Value,
+    pctx:        &PixelCtx,
+    mem:         &MemFlags,
+    memv:        &MemFlags,
+    dm1:         &Dm1,
+) {
+    let use_aux     = matches!(dm1.planes(),
+        p if p == DRAWMODE1_PLANES_OLAY || p == DRAWMODE1_PLANES_PUP || p == DRAWMODE1_PLANES_CID);
+    let depth_mask: i64  = match dm1.drawdepth() { 0 => 0xF, 1 => 0xFF, 2 => 0xFFF, _ => 0xFFFFFF };
+    let dblsrc_shift: i64 = match dm1.drawdepth() { 0 => 4, 1 => 8, 2 => 12, _ => 0 };
+    let (aux_read_shift0, aux_read_shift1, aux_read_mask): (i64, i64, i64) = match dm1.planes() {
+        p if p == DRAWMODE1_PLANES_OLAY => (8,  16, 0xFF),
+        p if p == DRAWMODE1_PLANES_CID  => (0,  4,  0x3),
+        p if p == DRAWMODE1_PLANES_PUP  => (2,  6,  0x3),
+        _                               => (0,  0,  0),
+    };
+
+    let needs_dst = dm1.blend() || dm1.logicop() != 3;
+    let fb_px_raw: Value = if needs_dst {
+        b.ins().load(types::I32, *memv, px_ptr, ir::immediates::Offset32::new(0))
+    } else {
+        b.ins().iconst(types::I32, 0)
+    };
+
+    let dst_plane: Value = if needs_dst {
+        if use_aux {
+            let read_shift = if dm1.dblsrc() { aux_read_shift1 } else { aux_read_shift0 };
+            let extracted  = if read_shift > 0 { b.ins().ushr_imm(fb_px_raw, read_shift) } else { fb_px_raw };
+            b.ins().band_imm(extracted, aux_read_mask)
+        } else if dm1.dblsrc() && dblsrc_shift > 0 {
+            let shifted = b.ins().ushr_imm(fb_px_raw, dblsrc_shift);
+            b.ins().band_imm(shifted, depth_mask)
+        } else {
+            b.ins().band_imm(fb_px_raw, depth_mask)
+        }
+    } else {
+        b.ins().iconst(types::I32, 0)
+    };
+
+    // Mirrors fastclear_color / blend / logic_op paths in process_pixel_draw
+    let result_val: Value = if dm1.fastclear() {
+        // fastclear_color: replicate colorvram nibble/byte/etc into all plane slots
+        match dm1.drawdepth() {
+            0 => {
+                let c   = b.ins().band_imm(pctx.colorvram_v, 0xf);
+                let c4  = b.ins().ishl_imm(c, 4);
+                let c8  = b.ins().ishl_imm(c, 8);
+                let c16 = b.ins().ishl_imm(c, 16);
+                let r1 = b.ins().bor(c, c4);
+                let r2 = b.ins().bor(c8, c16);
+                b.ins().bor(r1, r2)
+            }
+            1 => {
+                let c   = b.ins().band_imm(pctx.colorvram_v, 0xff);
+                let c8  = b.ins().ishl_imm(c, 8);
+                let c16 = b.ins().ishl_imm(c, 16);
+                let r1 = b.ins().bor(c, c8);
+                b.ins().bor(r1, c16)
+            }
+            2 => {
+                if dm1.rgbmode() {
+                    let hi  = b.ins().band_imm(pctx.colorvram_v, 0xf00000i64);
+                    let his = b.ins().ushr_imm(hi, 12);
+                    let mid = b.ins().band_imm(pctx.colorvram_v, 0xf000i64);
+                    let mids= b.ins().ushr_imm(mid, 8);
+                    let lo  = b.ins().band_imm(pctx.colorvram_v, 0xf0i64);
+                    let los = b.ins().ushr_imm(lo, 4);
+                    let r1  = b.ins().bor(his, mids);
+                    let c   = b.ins().bor(r1, los);
+                    let c12 = b.ins().ishl_imm(c, 12);
+                    b.ins().bor(c, c12)
+                } else {
+                    let c   = b.ins().band_imm(pctx.colorvram_v, 0xfffi64);
+                    let c12 = b.ins().ishl_imm(c, 12);
+                    b.ins().bor(c, c12)
+                }
+            }
+            _ => b.ins().band_imm(pctx.colorvram_v, 0xffffffi64),
+        }
+    } else if dm1.blend() {
+        // blend path: expand dst → blend → compress + amplify
+        let dst_24 = if dm1.rgbmode() && dm1.drawdepth() != 3 {
+            emit_expand_ir(b, dst_plane, dm1.drawdepth())
+        } else {
+            dst_plane
+        };
+        let blend_dst = if dm1.backblend() { pctx.colorback_v } else { dst_24 };
+        let blended   = emit_blend_ir(b, src_color, blend_dst, dm1.sfactor(), dm1.dfactor());
+        let packed    = bayer_pack_ir(b, blended, x_bayer, y_bayer);
+        let compressed = if dm1.rgbmode() && dm1.drawdepth() != 3 {
+            emit_compress_ir(b, packed, dm1.drawdepth(), dm1.dither())
+        } else { packed };
+        if dblsrc_shift > 0 {
+            let shifted = b.ins().ishl_imm(compressed, dblsrc_shift);
+            b.ins().bor(compressed, shifted)
+        } else { compressed }
+    } else {
+        // logic op path: compress → amplify src, amplify dst, logic op
+        let packed     = bayer_pack_ir(b, src_color, x_bayer, y_bayer);
+        let compressed = if dm1.rgbmode() && dm1.drawdepth() != 3 {
+            emit_compress_ir(b, packed, dm1.drawdepth(), dm1.dither())
+        } else { packed };
+        let amp_src = if use_aux {
+            amplify_aux_ir(b, compressed, dm1.planes())
+        } else if dblsrc_shift > 0 {
+            let shifted = b.ins().ishl_imm(compressed, dblsrc_shift);
+            b.ins().bor(compressed, shifted)
+        } else { compressed };
+        let amp_dst = if use_aux {
+            amplify_aux_ir(b, dst_plane, dm1.planes())
+        } else if dblsrc_shift > 0 {
+            let shifted = b.ins().ishl_imm(dst_plane, dblsrc_shift);
+            b.ins().bor(dst_plane, shifted)
+        } else { dst_plane };
+        emit_logic_op(b, dm1.logicop(), amp_src, amp_dst)
+    };
+
+    // Write: (fb[addr] & !wrmask) | (result & wrmask)
+    let old_val  = b.ins().load(types::I32, *memv, px_ptr, ir::immediates::Offset32::new(0));
+    let inv_mask = b.ins().bnot(pctx.wrmask_v);
+    let kept     = b.ins().band(old_val, inv_mask);
+    let written  = b.ins().band(result_val, pctx.wrmask_v);
+    let new_val = b.ins().bor(kept, written);
+    b.ins().store(*mem, new_val, px_ptr, ir::immediates::Offset32::new(0));
+}
+
 /// Emit the full shader IR. Returns false if the mode cannot be compiled.
 fn emit_shader(
     func: &mut ir::Function,
@@ -459,144 +757,19 @@ fn emit_shader(
     b.switch_to_block(pixel_block);
     b.seal_block(pixel_block);
 
-    // calculate_fb_address inlined:
-    // 1. apply xymove if xyoffset
-    let (x_curr, y_curr) = if dm0.xyoffset() {
-        let xm_raw  = b.ins().ushr_imm(xymove_v, 16);
-        let xm16    = b.ins().ireduce(types::I16, xm_raw);
-        let xm32    = b.ins().sextend(types::I32, xm16);
-        let ym_raw  = b.ins().band_imm(xymove_v, 0xFFFF_i64);
-        let ym16    = b.ins().ireduce(types::I16, ym_raw);
-        let ym32    = b.ins().sextend(types::I32, ym16);
-        let xc      = b.ins().iadd(x_v, xm32);
-        let yc      = b.ins().iadd(y_v, ym32);
-        (xc, yc)
-    } else {
-        (x_v, y_v)
+    let pctx = PixelCtx {
+        xywin_v, xymove_v, clipmode_v, wrmask_v, colorback_v, colorvram_v,
+        smask0x_v, smask0y_v, smask1x_v, smask1y_v,
+        smask2x_v, smask2y_v, smask3x_v, smask3y_v, smask4x_v, smask4y_v,
+        fb_rgb, fb_aux,
     };
 
-    // 2. apply xywin
-    let xw_raw  = b.ins().ushr_imm(xywin_v, 16);
-    let xw16    = b.ins().ireduce(types::I16, xw_raw);
-    let xw32    = b.ins().sextend(types::I32, xw16);
-    let yw_raw  = b.ins().band_imm(xywin_v, 0xFFFF_i64);
-    let yw16    = b.ins().ireduce(types::I16, yw_raw);
-    let yw32    = b.ins().sextend(types::I32, yw16);
-    let x_abs = b.ins().iadd(x_curr, xw32);
-    let y_abs = b.ins().iadd(y_curr, yw32);
+    let (px_ptr, x_bayer, y_bayer) = emit_calculate_fb_address(
+        &mut b, x_v, y_v, &pctx, skip_block, dm0, dm1,
+        coord_bias, c0, c2048, ptr_type,
+    );
 
-    // 3. clipping (smask0 = window-relative, smasks 1-4 = screen-absolute)
-    // Each clipping check that fails jumps to skip_block (no draw).
-    // smask0 (window-relative: compare x_curr/y_curr)
-    let after_clip = b.create_block();
-    {
-        let ensmask = b.ins().band_imm(clipmode_v, 0x1F_i64);
-        // smask0 (bit 0)
-        let bit0 = b.ins().band_imm(ensmask, 1);
-        let smask0_active = b.ins().icmp_imm(IntCC::NotEqual, bit0, 0);
-        let clip_check0 = b.create_block();
-        let pass0 = b.create_block();
-        b.ins().brif(smask0_active, clip_check0, &[], pass0, &[]);
-        b.switch_to_block(clip_check0); b.seal_block(clip_check0);
-        let sm0x_hi  = b.ins().ushr_imm(smask0x_v, 16);
-        let sm0x_hi16 = b.ins().ireduce(types::I16, sm0x_hi);
-        let min_x0   = b.ins().sextend(types::I32, sm0x_hi16);
-        let sm0x_lo16 = b.ins().ireduce(types::I16, smask0x_v);
-        let max_x0   = b.ins().sextend(types::I32, sm0x_lo16);
-        let sm0y_hi  = b.ins().ushr_imm(smask0y_v, 16);
-        let sm0y_hi16 = b.ins().ireduce(types::I16, sm0y_hi);
-        let min_y0   = b.ins().sextend(types::I32, sm0y_hi16);
-        let sm0y_lo16 = b.ins().ireduce(types::I16, smask0y_v);
-        let max_y0   = b.ins().sextend(types::I32, sm0y_lo16);
-        let ok0 = and4_range(&mut b, x_curr, y_curr, min_x0, max_x0, min_y0, max_y0);
-        b.ins().brif(ok0, pass0, &[], skip_block, &[]);
-        b.switch_to_block(pass0); b.seal_block(pass0);
-
-        // smasks 1-4 (screen-absolute: compare x_abs/y_abs)
-        // At least one must match if any are enabled.
-        let smask_hi = b.ins().band_imm(ensmask, 0x1E_i64);
-        let any_smask = b.ins().icmp_imm(IntCC::NotEqual, smask_hi, 0);
-        let smask_check = b.create_block();
-        b.ins().brif(any_smask, smask_check, &[], after_clip, &[]);
-        b.switch_to_block(smask_check); b.seal_block(smask_check);
-
-        let masks = [
-            (smask1x_v, smask1y_v, 2i64),
-            (smask2x_v, smask2y_v, 4i64),
-            (smask3x_v, smask3y_v, 8i64),
-            (smask4x_v, smask4y_v, 16i64),
-        ];
-        // Build OR chain: inside_any = mask1_ok | mask2_ok | mask3_ok | mask4_ok
-        // Use I1 values combined with bor
-        let mut inside_any: Value = b.ins().iconst(types::I8, 0); // start as I8 zero
-        for (sx, sy, bit_mask) in masks {
-            let bit      = b.ins().band_imm(ensmask, bit_mask);
-            let enabled  = b.ins().icmp_imm(IntCC::NotEqual, bit, 0); // I1
-            // Split nested sextend/ireduce/ushr into steps
-            let sx_hi    = b.ins().ushr_imm(sx, 16);
-            let sx_hi16  = b.ins().ireduce(types::I16, sx_hi);
-            let min_x    = b.ins().sextend(types::I32, sx_hi16);
-            let sx_lo16  = b.ins().ireduce(types::I16, sx);
-            let max_x    = b.ins().sextend(types::I32, sx_lo16);
-            let sy_hi    = b.ins().ushr_imm(sy, 16);
-            let sy_hi16  = b.ins().ireduce(types::I16, sy_hi);
-            let min_y    = b.ins().sextend(types::I32, sy_hi16);
-            let sy_lo16  = b.ins().ireduce(types::I16, sy);
-            let max_y    = b.ins().sextend(types::I32, sy_lo16);
-            let in_range = and4_range(&mut b, x_abs, y_abs, min_x, max_x, min_y, max_y); // I8
-            // enabled (I8) & in_range (I8) — band directly
-            let contrib  = b.ins().band(enabled, in_range);
-            inside_any   = b.ins().bor(inside_any, contrib);
-        }
-        let inside = b.ins().icmp_imm(IntCC::NotEqual, inside_any, 0);
-        b.ins().brif(inside, after_clip, &[], skip_block, &[]);
-    }
-
-    b.switch_to_block(after_clip); b.seal_block(after_clip);
-
-    // 4. Physical address: addr = (y_abs - coord_bias) * 2048 + (x_abs - coord_bias)
-    //    with yflip: y_phys = 0x23FF - y_abs
-    let y_phys = if dm1.yflip() {
-        let c23ff = b.ins().iconst(types::I32, 0x23FF);
-        b.ins().isub(c23ff, y_abs)
-    } else {
-        b.ins().isub(y_abs, coord_bias)
-    };
-    let x_phys = b.ins().isub(x_abs, coord_bias);
-
-    // Bounds check (VRAM clipping)
-    let screen_w = b.ins().iconst(types::I32, REX3_SCREEN_WIDTH as i64);
-    let screen_h = b.ins().iconst(types::I32, REX3_SCREEN_HEIGHT as i64);
-    let x_neg = b.ins().icmp(IntCC::SignedLessThan, x_phys, c0);
-    let x_wide = b.ins().icmp(IntCC::SignedGreaterThanOrEqual, x_phys, screen_w);
-    let y_neg  = b.ins().icmp(IntCC::SignedLessThan, y_phys, c0);
-    let y_tall = b.ins().icmp(IntCC::SignedGreaterThanOrEqual, y_phys, screen_h);
-    let oob = {
-        let a = b.ins().bor(x_neg, x_wide);
-        let c_v = b.ins().bor(y_neg, y_tall);
-        b.ins().bor(a, c_v)
-    };
-    let in_bounds = b.create_block();
-    b.ins().brif(oob, skip_block, &[], in_bounds, &[]);
-    b.switch_to_block(in_bounds); b.seal_block(in_bounds);
-
-    // addr = y_phys * 2048 + x_phys  (as u32 index into fb_rgb/fb_aux)
-    let ym2048  = b.ins().imul(y_phys, c2048);
-    let addr_i32 = b.ins().iadd(ym2048, x_phys);
-    // byte offset = addr_i32 * 4 (each fb entry is u32)
-    let c4       = b.ins().iconst(types::I32, 4);
-    let byte_off = b.ins().imul(addr_i32, c4);
-    let byte_off64 = b.ins().uextend(types::I64, byte_off);
-
-    // Choose fb pointer: rgb planes → fb_rgb, aux planes → fb_aux
-    let use_aux = matches!(dm1.planes(), p if p == DRAWMODE1_PLANES_OLAY || p == DRAWMODE1_PLANES_PUP || p == DRAWMODE1_PLANES_CID);
-    let fb_ptr  = if use_aux { fb_aux } else { fb_rgb };
-    // fb_ptr is already a native pointer (ptr_type); byte_off64 is I64.
-    // On x86-64 ptr_type == I64, so no extend needed.
-    let px_ptr = b.ins().iadd(fb_ptr, byte_off64);
-
-    // ── Pixel processing ──────────────────────────────────────────────────────
-    // Source color
+    // ── Source color ──────────────────────────────────────────────────────────
     let raw_src = if dm0.shade() {
         // combine_host_dda: RGB clamp per component
         let r = clamp_color_component(&mut b, colorred_v);
@@ -686,157 +859,7 @@ fn emit_shader(
     let use_bg_bool = b.ins().icmp_imm(IntCC::NotEqual, use_bg_flag, 0);
     let src_color = b.ins().select(use_bg_bool, colorback_v, raw_src);
 
-    // Read current fb pixel (needed for logic ops that read dst, and for blend)
-    let needs_dst = dm1.blend() || dm1.logicop() != 3 /* SRC */;
-    let fb_px_raw: Value = if needs_dst {
-        // px_ptr is I64; load needs a ptr-type value; use it directly as addr
-        b.ins().load(types::I32, memv, px_ptr, ir::immediates::Offset32::new(0))
-    } else {
-        b.ins().iconst(types::I32, 0)
-    };
-
-    // Read/mask for depth.
-    // For RGB planes: dblsrc selects bank 0 (low bits) or bank 1 (high bits).
-    // For aux planes: bit layout is fixed by plane type (not depth bits).
-    // dblsrc_shift is also the amplify shift for RGB (replicate pixel across its slot width).
-    let depth_mask: i64 = match dm1.drawdepth() { 0 => 0xF, 1 => 0xFF, 2 => 0xFFF, _ => 0xFFFFFF };
-    let dblsrc_shift: i64 = match dm1.drawdepth() { 0 => 4, 1 => 8, 2 => 12, _ => 0 };
-
-    // For aux planes the read offset and mask differ from RGB:
-    // OLAY bank0: bits[15:8], bank1: bits[23:16], mask=0xFF
-    // CID  bank0: bits[1:0],  bank1: bits[5:4],   mask=0x3
-    // PUP  bank0: bits[3:2],  bank1: bits[7:6],   mask=0x3
-    let (aux_read_shift0, aux_read_shift1, aux_read_mask): (i64, i64, i64) = match dm1.planes() {
-        p if p == DRAWMODE1_PLANES_OLAY => (8,  16, 0xFF),
-        p if p == DRAWMODE1_PLANES_CID  => (0,  4,  0x3),
-        p if p == DRAWMODE1_PLANES_PUP  => (2,  6,  0x3),
-        _                               => (0,  0,  0),
-    };
-
-    let dst_plane = if needs_dst {
-        if use_aux {
-            // Aux plane: extract from fixed bit position
-            let read_shift = if dm1.dblsrc() { aux_read_shift1 } else { aux_read_shift0 };
-            let extracted = if read_shift > 0 {
-                b.ins().ushr_imm(fb_px_raw, read_shift)
-            } else {
-                fb_px_raw
-            };
-            b.ins().band_imm(extracted, aux_read_mask)
-        } else if dm1.dblsrc() && dblsrc_shift > 0 {
-            let shifted = b.ins().ushr_imm(fb_px_raw, dblsrc_shift);
-            b.ins().band_imm(shifted, depth_mask)
-        } else {
-            b.ins().band_imm(fb_px_raw, depth_mask)
-        }
-    } else {
-        b.ins().iconst(types::I32, 0)
-    };
-
-    // Result pixel value
-    let result_val: Value = if dm1.fastclear() {
-        // Fast clear: replicate colorvram into plane slots (matches fastclear_color in rex3.rs)
-        match dm1.drawdepth() {
-            0 => { // 4bpp: replicate nibble
-                let c = b.ins().band_imm(colorvram_v, 0xf);
-                let c4 = b.ins().ishl_imm(c, 4);
-                let c8 = b.ins().ishl_imm(c, 8);
-                let c16 = b.ins().ishl_imm(c, 16);
-                let r1 = b.ins().bor(c, c4);
-                let r2 = b.ins().bor(r1, c8);
-                b.ins().bor(r2, c16)
-            }
-            1 => { // 8bpp: replicate byte
-                let c = b.ins().band_imm(colorvram_v, 0xff);
-                let c8  = b.ins().ishl_imm(c, 8);
-                let c16 = b.ins().ishl_imm(c, 16);
-                let r1 = b.ins().bor(c, c8);
-                b.ins().bor(r1, c16)
-            }
-            2 => { // 12bpp
-                if dm1.rgbmode() {
-                    let hi = b.ins().band_imm(colorvram_v, 0xf00000i64);
-                    let hi_s = b.ins().ushr_imm(hi, 12);
-                    let mid = b.ins().band_imm(colorvram_v, 0xf000i64);
-                    let mid_s = b.ins().ushr_imm(mid, 8);
-                    let lo = b.ins().band_imm(colorvram_v, 0xf0i64);
-                    let lo_s = b.ins().ushr_imm(lo, 4);
-                    let r1 = b.ins().bor(hi_s, mid_s);
-                    let c = b.ins().bor(r1, lo_s);
-                    let c12 = b.ins().ishl_imm(c, 12);
-                    b.ins().bor(c, c12)
-                } else {
-                    let c = b.ins().band_imm(colorvram_v, 0xfffi64);
-                    let c12 = b.ins().ishl_imm(c, 12);
-                    b.ins().bor(c, c12)
-                }
-            }
-            _ => b.ins().band_imm(colorvram_v, 0xffffffi64), // 24bpp
-        }
-    } else if dm1.blend() {
-        // Blend path: expand dst to 24-bit BGR, blend, compress back
-        let dst_24 = if dm1.rgbmode() && dm1.drawdepth() != 3 {
-            emit_expand_ir(&mut b, dst_plane, dm1.drawdepth())
-        } else {
-            dst_plane
-        };
-        let blend_dst = if dm1.backblend() { colorback_v } else { dst_24 };
-        let blended = emit_blend_ir(&mut b, src_color, blend_dst, dm1.sfactor(), dm1.dfactor());
-        // bayer_pack + compress + amplify
-        let packed = bayer_pack_ir(&mut b, blended, x_v, y_v);
-        let compressed = if dm1.rgbmode() && dm1.drawdepth() != 3 {
-            emit_compress_ir(&mut b, packed, dm1.drawdepth(), dm1.dither())
-        } else {
-            packed
-        };
-        // Amplify: replicate into both banks (sub-24bpp only; 24bpp is identity)
-        if dblsrc_shift > 0 {
-            let shifted = b.ins().ishl_imm(compressed, dblsrc_shift);
-            b.ins().bor(compressed, shifted)
-        } else {
-            compressed
-        }
-    } else {
-        // Logic op path
-        // compress(bayer_pack(raw_src, x, y))
-        let packed = bayer_pack_ir(&mut b, src_color, x_v, y_v);
-        let compressed = if dm1.rgbmode() && dm1.drawdepth() != 3 {
-            emit_compress_ir(&mut b, packed, dm1.drawdepth(), dm1.dither())
-        } else {
-            packed
-        };
-        // Amplify: replicate pixel into both banks before logic op.
-        // For RGB planes: amplify_rgb_N(v) = v | (v << depth_shift) for sub-24bpp.
-        // For aux planes: use plane-specific amplify packing.
-        // For 24bpp RGB: identity (dblsrc_shift == 0).
-        let amp_src = if use_aux {
-            amplify_aux_ir(&mut b, compressed, dm1.planes())
-        } else if dblsrc_shift > 0 {
-            let shifted = b.ins().ishl_imm(compressed, dblsrc_shift);
-            b.ins().bor(compressed, shifted)
-        } else {
-            compressed
-        };
-        let amp_dst = if use_aux {
-            amplify_aux_ir(&mut b, dst_plane, dm1.planes())
-        } else if dblsrc_shift > 0 {
-            let shifted = b.ins().ishl_imm(dst_plane, dblsrc_shift);
-            b.ins().bor(dst_plane, shifted)
-        } else {
-            dst_plane
-        };
-        // logic op
-        emit_logic_op(&mut b, dm1.logicop(), amp_src, amp_dst)
-    };
-
-    // Write result: (fb[addr] & !wrmask) | (result & wrmask)
-    // px_ptr is the already-computed I64 byte address
-    let old_val     = b.ins().load(types::I32, memv, px_ptr, ir::immediates::Offset32::new(0));
-    let inv_mask    = b.ins().bnot(wrmask_v);
-    let kept        = b.ins().band(old_val, inv_mask);
-    let written     = b.ins().band(result_val, wrmask_v);
-    let new_val     = b.ins().bor(kept, written);
-    b.ins().store(mem, new_val, px_ptr, ir::immediates::Offset32::new(0));
+    emit_pixel_write(&mut b, px_ptr, x_bayer, y_bayer, src_color, &pctx, &mem, &memv, dm1);
     b.ins().jump(skip_block, &[]);
 
     // ── skip_block: shade + pattern advance, then check end-of-x ─────────────
