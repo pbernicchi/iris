@@ -2913,14 +2913,7 @@ impl Rex3 {
         self.diag.fetch_or(Self::DIAG_LOOP_EXECUTE_GO, Ordering::Relaxed);
         let ctx = unsafe { &mut *self.context.get() };
         let opcode = ctx.drawmode0.opcode();
-        // SCR2SCR copies already-quantized pixels — dithering would corrupt them.
-        let dm1_for_setup = if opcode == DRAWMODE0_OPCODE_SCR2SCR {
-            DrawMode1(ctx.drawmode1.0 & !(1 << 16)) // clear DITHER bit
-        } else {
-            ctx.drawmode1
-        };
-        self.planes_setup(dm1_for_setup);
-        self.host_setup(ctx.drawmode1);
+
         // FIXME: unclear whether pat_bit/zpat_bit should reset to 31 on every GO or carry
         // over across primitives.  GL stippled line loops likely want continuity between
         // segments; resetting here would break that.  Need a real test app on hardware to
@@ -2934,67 +2927,6 @@ impl Rex3 {
         // FIXME: also unclear whether pattern advance is ROL (rotate-left, hardware
         // recirculation) or ROR as currently implemented.  Suspect ROL based on
         // "recirculating iterator" language in the spec.  Verify with test app on real Indy.
-
-        let proc = match opcode {
-            DRAWMODE0_OPCODE_READ    => Self::process_pixel_read,
-            DRAWMODE0_OPCODE_DRAW    => {
-                let cidmatch = (ctx.clipmode >> CLIPMODE_CIDMATCH_SHIFT) & 0xF;
-                let no_cid      = cidmatch == 0xF;
-                let no_host     = !ctx.drawmode0.colorhost() && !ctx.drawmode0.alphahost();
-                let no_blend    = !ctx.drawmode1.blend();
-                let en_z        = ctx.drawmode0.enzpattern();
-                let en_ls       = ctx.drawmode0.enlspattern();
-                let no_zpopaque = !ctx.drawmode0.zpopaque();
-                let is_src_op   = ctx.drawmode1.logicop() == DRAWMODE1_LOGICOP_SRC >> 28;
-
-                if ctx.drawmode1.fastclear() && no_cid {
-                    Self::process_pixel_fastclear
-                } else if no_cid && no_host && no_blend && en_z && !en_ls && no_zpopaque && is_src_op {
-                    // Character/glyph: zpattern kill only, SRC logicop — no dst read needed.
-                    Self::process_pixel_zpattern
-                } else if no_cid && no_host && no_blend {
-                    // Common solid fills, spans, lines: no blend, no host FIFO.
-                    Self::process_pixel_noblend
-                } else {
-                    Self::process_pixel_draw
-                }
-            }
-            DRAWMODE0_OPCODE_SCR2SCR => Self::process_pixel_scr2scr,
-            _                        => Self::process_pixel_noop,
-        };
-        unsafe { *self.px_proc.get() = proc; }
-
-        // Select shade iterate fn.
-        // RGB mode: always clamp (spec §3.8: "DDA values of R,G,B,A are clamped each
-        // iteration before sending down the pipeline").
-        // CI mode: clamp only when CICLAMP is set (DRAWMODE0 bit 21 = ENCICLAMP).
-        let shade_fn: fn(&mut Rex3Context) = if ctx.drawmode0.shade() {
-            if ctx.drawmode1.rgbmode() {
-                Self::iterate_shade_rgb_clamp
-            } else if ctx.drawmode0.ciclamp() {
-                match ctx.drawmode1.drawdepth() {
-                    1 => Self::iterate_shade_ci8_clamp,
-                    2 => Self::iterate_shade_ci12_clamp,
-                    _ => Self::iterate_shade_unclamped, // 4bpp / 24bpp: no CI clamp per spec
-                }
-            } else {
-                Self::iterate_shade_unclamped
-            }
-        } else {
-            Self::iterate_shade_noop
-        };
-        unsafe { *self.px_shade.get() = shade_fn; }
-
-        // Select pattern iterate fn.
-        let en_z  = ctx.drawmode0.enzpattern();
-        let en_ls = ctx.drawmode0.enlspattern();
-        let pat_fn: fn(&mut Rex3Context) = match (en_z, en_ls) {
-            (false, false) => Self::iterate_pattern_noop,
-            (true,  false) => Self::iterate_pattern_z,
-            (false, true)  => Self::iterate_pattern_ls,
-            (true,  true)  => Self::iterate_pattern_both,
-        };
-        unsafe { *self.px_pattern.get() = pat_fn; }
 
         if ctx.drawmode0.dosetup() {
             self.setup(ctx);
@@ -3070,6 +3002,78 @@ impl Rex3 {
             }
             } // jit_enabled
         }
+
+        // Interpreter-only setup: function pointer selection and host/planes dispatch tables.
+        // Skipped when JIT handles the draw.
+        // SCR2SCR copies already-quantized pixels — dithering would corrupt them.
+        let dm1_for_setup = if opcode == DRAWMODE0_OPCODE_SCR2SCR {
+            DrawMode1(ctx.drawmode1.0 & !(1 << 16)) // clear DITHER bit
+        } else {
+            ctx.drawmode1
+        };
+        self.planes_setup(dm1_for_setup);
+        self.host_setup(ctx.drawmode1);
+
+        let proc = match opcode {
+            DRAWMODE0_OPCODE_READ    => Self::process_pixel_read,
+            DRAWMODE0_OPCODE_DRAW    => {
+                let cidmatch = (ctx.clipmode >> CLIPMODE_CIDMATCH_SHIFT) & 0xF;
+                let no_cid      = cidmatch == 0xF;
+                let no_host     = !ctx.drawmode0.colorhost() && !ctx.drawmode0.alphahost();
+                let no_blend    = !ctx.drawmode1.blend();
+                let en_z        = ctx.drawmode0.enzpattern();
+                let en_ls       = ctx.drawmode0.enlspattern();
+                let no_zpopaque = !ctx.drawmode0.zpopaque();
+                let is_src_op   = ctx.drawmode1.logicop() == DRAWMODE1_LOGICOP_SRC >> 28;
+
+                if ctx.drawmode1.fastclear() && no_cid {
+                    Self::process_pixel_fastclear
+                } else if no_cid && no_host && no_blend && en_z && !en_ls && no_zpopaque && is_src_op {
+                    // Character/glyph: zpattern kill only, SRC logicop — no dst read needed.
+                    Self::process_pixel_zpattern
+                } else if no_cid && no_host && no_blend {
+                    // Common solid fills, spans, lines: no blend, no host FIFO.
+                    Self::process_pixel_noblend
+                } else {
+                    Self::process_pixel_draw
+                }
+            }
+            DRAWMODE0_OPCODE_SCR2SCR => Self::process_pixel_scr2scr,
+            _                        => Self::process_pixel_noop,
+        };
+        unsafe { *self.px_proc.get() = proc; }
+
+        // Select shade iterate fn.
+        // RGB mode: always clamp (spec §3.8: "DDA values of R,G,B,A are clamped each
+        // iteration before sending down the pipeline").
+        // CI mode: clamp only when CICLAMP is set (DRAWMODE0 bit 21 = ENCICLAMP).
+        let shade_fn: fn(&mut Rex3Context) = if ctx.drawmode0.shade() {
+            if ctx.drawmode1.rgbmode() {
+                Self::iterate_shade_rgb_clamp
+            } else if ctx.drawmode0.ciclamp() {
+                match ctx.drawmode1.drawdepth() {
+                    1 => Self::iterate_shade_ci8_clamp,
+                    2 => Self::iterate_shade_ci12_clamp,
+                    _ => Self::iterate_shade_unclamped, // 4bpp / 24bpp: no CI clamp per spec
+                }
+            } else {
+                Self::iterate_shade_unclamped
+            }
+        } else {
+            Self::iterate_shade_noop
+        };
+        unsafe { *self.px_shade.get() = shade_fn; }
+
+        // Select pattern iterate fn.
+        let en_z  = ctx.drawmode0.enzpattern();
+        let en_ls = ctx.drawmode0.enlspattern();
+        let pat_fn: fn(&mut Rex3Context) = match (en_z, en_ls) {
+            (false, false) => Self::iterate_pattern_noop,
+            (true,  false) => Self::iterate_pattern_z,
+            (false, true)  => Self::iterate_pattern_ls,
+            (true,  true)  => Self::iterate_pattern_both,
+        };
+        unsafe { *self.px_pattern.get() = pat_fn; }
 
         if opcode != DRAWMODE0_OPCODE_NOOP {
             let adrmode = ctx.drawmode0.adrmode() << 2;
