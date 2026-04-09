@@ -12,26 +12,33 @@ Boots IRIX 6.5 and 5.3. Has networking. Has a framebuffer.
 ## Q&A
 
 **Q: What is it?**
-An SGI Indy (MIPS R4400) emulator. Emulates enough hardware that IRIX
+
+**A:** An SGI Indy (MIPS R4400) emulator. Emulates enough hardware that IRIX
 boots to a usable system: shell, networking, X11, the works.
 
 **Q: But why?**
-Wanted to see how far vibe coding could go, and to learn some Rust along the way.
+
+**A:** Wanted to see how far vibe coding could go, and to learn some Rust along the way.
 
 **Q: You could have improved MAME.**
-Didn't seem like fun.
+
+**A:** Didn't seem like fun.
 
 **Q: So did you learn Rust?**
-LOL, my brain hurts. Let's not get ahead of ourselves.
+
+**A:** LOL, my brain hurts. Let's not get ahead of ourselves.
 
 **Q: What LLMs did you use?**
-Mostly Claude, some Gemini. They wrote a lot of the hard parts. (This was written by Claude, the humble AI assistant).
+
+**A:** Mostly Claude, some Gemini. They wrote a lot of the hard parts. (This was written by Claude, the humble AI assistant).
 
 **Q: Can I contribute?**
-Yes, bug reports and merge requests are welcome.
+
+**A:** Yes, bug reports and merge requests are welcome.
 
 **Q: Regrets?**
-Yes.
+
+**A:** Yes.
 
 
 ## Current status
@@ -60,15 +67,20 @@ cargo run --release
 
 Build variants:
 ```
-cargo run --release --features lightning    # disable breakpoints for ~10% more speed
-cargo run --release --features jit         # enable Cranelift JIT compiler
+cargo run --release --features lightning             # disable breakpoints for ~10% more speed
+cargo run --release --features jit                   # enable Cranelift MIPS JIT compiler
+cargo run --release --features rex-jit               # enable REX3 graphics JIT compiler
+cargo run --release --features jit,rex-jit           # both JITs
+cargo run --release --features lightning,rex-jit     # recommended for best speed right now
 ```
 
 See [HELP.md](HELP.md) for the full rundown: serial ports, monitor console,
 NVRAM/MAC address setup, disk image prep, and more.
 
 
-## JIT compiler
+## JIT compilers
+
+### MIPS JIT (`--features jit`)
 
 Optional Cranelift-based JIT. Compiles hot MIPS basic blocks to native x86_64.
 Enable with `--features jit` at build time and `IRIS_JIT=1` at runtime.
@@ -79,6 +91,18 @@ interval is adaptive. Hot block profiles persist across sessions.
 
 ```
 IRIS_JIT=1 cargo run --release --features jit
+```
+
+### REX3 graphics JIT (`--features rex-jit`)
+
+Cranelift-based JIT for the REX3 graphics chip draw pipeline. Compiles a
+specialized native shader per unique (DrawMode0, DrawMode1) pair, inlining the
+entire draw loop — coordinate stepping, clipping, shade DDA, pattern advance —
+into a single function. Shaders compile in the background on first use; compiled
+profiles persist across sessions for instant warm-up on next boot.
+
+```
+cargo run --release --features rex-jit
 ```
 
 | Variable | Default | Description |
