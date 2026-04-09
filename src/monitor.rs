@@ -56,7 +56,7 @@ fn handle_client(stream: TcpStream, devices: Arc<Mutex<Vec<Arc<dyn Device>>>>) {
             let _ = write!(writer, "{}\r\n", line);
         }
     }
-    let _ = write!(writer, "\r\nIRIS Monitor\r\n> ");
+    let _ = write!(writer, "\r\n{} Monitor\r\n> ", crate::machine::emulator_name());
     let _ = writer.flush();
     
     loop {

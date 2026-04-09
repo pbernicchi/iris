@@ -33,6 +33,29 @@ use crate::rex3::Rex3;
 use crate::snapshot::Snapshot;
 use crate::hptimer::TimerManager;
 
+pub fn emulator_name() -> &'static str {
+    static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+
+        if now % 4 != 0 {
+            return "Irresponsible Rust IRIX Simulator".to_string();
+        }
+
+        let firsts = ["Irresponsible", "Incredible", "Insufferable", "Infuriating", "Inaccurate", "Incomplete", "Interactive"];
+        let thirds = ["IRIX", "Indy", "Iris"];
+        let fourths = ["Simulator", "System", "Substitute", "Sandbox"];
+
+        let first = firsts[((now / 4) % firsts.len() as u64) as usize];
+        let third = thirds[((now / 64) % thirds.len() as u64) as usize];
+        let fourth = fourths[((now / 256) % fourths.len() as u64) as usize];
+
+        format!("{} Rust {} {}", first, third, fourth)
+    }).as_str()
+}
 
 pub struct Machine {
     cpu: Arc<MipsCpu<MipsTlb, R4000Cache>>,
@@ -341,7 +364,7 @@ impl Machine {
     }
 
     pub fn run_console_client() {
-        println!("IRIS: Irresponsible Rust Irix Simulator");
+        println!("IRIS: {}", emulator_name());
         println!("Connecting to monitor socket...");
 
         let mut stream = loop {

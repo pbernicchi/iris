@@ -412,7 +412,7 @@ impl Ui {
         let w = 1024 * scale;
         let h = (768 + STATUS_BAR_HEIGHT as u32) * scale;
         let window_builder = WindowBuilder::new()
-            .with_title("Irresponsible Rust IRIX Simulator")
+            .with_title(crate::machine::emulator_name())
             .with_resizable(false)
             .with_enabled_buttons(winit::window::WindowButtons::CLOSE | winit::window::WindowButtons::MINIMIZE)
             .with_inner_size(winit::dpi::PhysicalSize::new(w, h));
