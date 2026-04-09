@@ -2924,4 +2924,279 @@ mod jit_tests {
             dm0, dm1,
         );
     }
+
+    // ── HOSTRW JIT tests ──────────────────────────────────────────────────────
+    //
+    // For HOSTRW, compare_jit_interp can't be used directly since the GO trigger
+    // is a write to HOSTRW0 rather than DRAWMODE0.  Each test runs the same HOSTRW
+    // sequence on both an interpreter-only instance and a JIT instance, then compares
+    // the resulting framebuffer region.
+    //
+    // Pattern:
+    //   1. Set up both instances identically (DM1, WRMASK, coords, DM0 in SET space).
+    //   2. Run the HOSTRW GO sequence on the interpreter instance.
+    //   3. On the JIT instance: trigger compile with one GO, wait for compile, reset fb,
+    //      then replay the full GO sequence via JIT.
+    //   4. Compare framebuffer regions.
+
+    /// CI8 HOSTW 32-bit packed: 4 CI8 pixels per 32-bit word.
+    /// Mirrors test_hostw_ci8_write_block_32bit.
+    #[test]
+    fn jit_hostw_ci8_block_32bit() {
+        let dm0 = DM0_HOSTW_BLOCK;
+        let dm1 = DM1_CI8_HOSTRW;
+        let word: u32 = (0x11u32 << 24) | (0x22 << 16) | (0x33 << 8) | 0x44;
+
+        let setup = |rex: &Rex3| {
+            reg(rex, REX3_DRAWMODE1, dm1);
+            reg(rex, REX3_WRMASK,    0xFF);
+            reg(rex, REX3_XYENDI,    xy(3, 0));
+            reg(rex, REX3_XYSTARTI,  xy(0, 0));
+            reg(rex, REX3_DRAWMODE0, dm0); // SET — no draw yet
+        };
+
+        // Interpreter run
+        let rex_i = make_rex3();
+        rex3init(rex_i);
+        setup(rex_i);
+        write_hostrw32(rex_i, word);
+        wait(rex_i);
+        let fb_interp: Vec<u32> = (0..4).map(|x| read_pixel(rex_i, x, 0) & 0xFF).collect();
+
+        // JIT run: trigger compile, wait, replay
+        let rex_j = make_rex3_jit();
+        rex3init(rex_j);
+        setup(rex_j);
+        write_hostrw32(rex_j, word); // triggers compile request
+        wait(rex_j);
+        if let Some(ref jit) = rex_j.rex_jit {
+            assert!(jit.wait_compiled(dm0, dm1),
+                "JIT compile failed dm0={dm0:#010x} dm1={dm1:#010x}");
+        }
+        // Reset and replay via JIT
+        clear_region(rex_j, 0, 0, 3, 0);
+        rex3init(rex_j);
+        setup(rex_j);
+        write_hostrw32(rex_j, word);
+        wait(rex_j);
+        let fb_jit: Vec<u32> = (0..4).map(|x| read_pixel(rex_j, x, 0) & 0xFF).collect();
+
+        assert_eq!(fb_interp, fb_jit,
+            "CI8 HOSTW JIT/interp mismatch: interp={fb_interp:?} jit={fb_jit:?}");
+    }
+
+    /// RGB24 HOSTW 32-bit: 1 pixel per word (non-packed, hostdepth=3).
+    /// Mirrors test_hostw_rgb24_write_block_32bit.
+    #[test]
+    fn jit_hostw_rgb24_block_32bit() {
+        let dm0 = DM0_HOSTW_BLOCK;
+        let dm1 = DM1_RGB24_HOSTRW;
+        let pixels: &[u32] = &[0x0000FF, 0x00FF00, 0xFF0000, 0xAABBCC];
+
+        let setup = |rex: &Rex3| {
+            reg(rex, REX3_DRAWMODE1, dm1);
+            reg(rex, REX3_WRMASK,    0xFFFFFF);
+            reg(rex, REX3_XYENDI,    xy(3, 0));
+            reg(rex, REX3_XYSTARTI,  xy(0, 0));
+            reg(rex, REX3_DRAWMODE0, dm0);
+        };
+
+        // Interpreter run
+        let rex_i = make_rex3();
+        rex3init(rex_i);
+        setup(rex_i);
+        for &p in pixels { write_hostrw32(rex_i, p); }
+        wait(rex_i);
+        let fb_interp: Vec<u32> = (0..4).map(|x| read_pixel(rex_i, x, 0) & 0xFFFFFF).collect();
+
+        // JIT run
+        let rex_j = make_rex3_jit();
+        rex3init(rex_j);
+        setup(rex_j);
+        write_hostrw32(rex_j, pixels[0]); // trigger compile
+        wait(rex_j);
+        if let Some(ref jit) = rex_j.rex_jit {
+            assert!(jit.wait_compiled(dm0, dm1),
+                "JIT compile failed dm0={dm0:#010x} dm1={dm1:#010x}");
+        }
+        clear_region(rex_j, 0, 0, 3, 0);
+        rex3init(rex_j);
+        setup(rex_j);
+        for &p in pixels { write_hostrw32(rex_j, p); }
+        wait(rex_j);
+        let fb_jit: Vec<u32> = (0..4).map(|x| read_pixel(rex_j, x, 0) & 0xFFFFFF).collect();
+
+        assert_eq!(fb_interp, fb_jit,
+            "RGB24 HOSTW JIT/interp mismatch: interp={fb_interp:?} jit={fb_jit:?}");
+    }
+
+    /// RGB24 HOSTW 64-bit: 2 pixels per 64-bit word.
+    /// Mirrors test_hostw_rgb24_write_block_64bit.
+    #[test]
+    fn jit_hostw_rgb24_block_64bit() {
+        let dm0 = DM0_HOSTW_BLOCK;
+        let dm1 = DM1_RGB24_HOSTRW64;
+        let p0: u32 = 0x00FF0000;
+        let p1: u32 = 0x0000FF00;
+        let word64: u64 = ((p0 as u64) << 32) | (p1 as u64);
+
+        let setup = |rex: &Rex3| {
+            reg(rex, REX3_DRAWMODE1, dm1);
+            reg(rex, REX3_WRMASK,    0xFFFFFF);
+            reg(rex, REX3_XYENDI,    xy(1, 0));
+            reg(rex, REX3_XYSTARTI,  xy(0, 0));
+            reg(rex, REX3_DRAWMODE0, dm0);
+        };
+
+        let rex_i = make_rex3();
+        rex3init(rex_i);
+        setup(rex_i);
+        write_hostrw64(rex_i, word64);
+        wait(rex_i);
+        let fb_interp: Vec<u32> = (0..2).map(|x| read_pixel(rex_i, x, 0) & 0xFFFFFF).collect();
+
+        let rex_j = make_rex3_jit();
+        rex3init(rex_j);
+        setup(rex_j);
+        write_hostrw64(rex_j, word64);
+        wait(rex_j);
+        if let Some(ref jit) = rex_j.rex_jit {
+            assert!(jit.wait_compiled(dm0, dm1),
+                "JIT compile failed dm0={dm0:#010x} dm1={dm1:#010x}");
+        }
+        clear_region(rex_j, 0, 0, 1, 0);
+        rex3init(rex_j);
+        setup(rex_j);
+        write_hostrw64(rex_j, word64);
+        wait(rex_j);
+        let fb_jit: Vec<u32> = (0..2).map(|x| read_pixel(rex_j, x, 0) & 0xFFFFFF).collect();
+
+        assert_eq!(fb_interp, fb_jit,
+            "RGB24 HOSTW64 JIT/interp mismatch: interp={fb_interp:?} jit={fb_jit:?}");
+    }
+
+    /// CI8 HOSTR 32-bit: read 4 CI8 pixels from framebuffer into one word.
+    /// Mirrors test_hostr_ci8_read_block_32bit.
+    #[test]
+    fn jit_hostr_ci8_block_32bit() {
+        // DM0 for READ
+        let dm0_read = DRAWMODE0_OPCODE_READ | DRAWMODE0_ADRMODE_BLOCK | DM0_STOPONXY;
+        let dm1 = DM1_CI8_HOSTRW;
+
+        // Fill 4 pixels with known CI8 values using interpreter
+        let fill_rex = make_rex3();
+        rex3init(fill_rex);
+        reg(fill_rex, REX3_DRAWMODE1, DM1_CI8_SRC);
+        reg(fill_rex, REX3_WRMASK, 0xFF);
+        let pixels_in = [0x11u32, 0x22, 0x33, 0x44];
+        for (x, &v) in pixels_in.iter().enumerate() {
+            reg(fill_rex, REX3_COLORI,    v);
+            reg(fill_rex, REX3_XYSTARTI,  xy(x as i32, 0));
+            reg_go(fill_rex, REX3_XYENDI, xy(x as i32, 0));
+        }
+
+        let setup_read = |rex: &Rex3| {
+            // Copy framebuffer from fill_rex
+            unsafe {
+                let src = &*fill_rex.fb_rgb.get();
+                let dst = &mut *rex.fb_rgb.get();
+                dst[0..4].copy_from_slice(&src[0..4]);
+            }
+            reg(rex, REX3_DRAWMODE1, dm1);
+            reg(rex, REX3_WRMASK,    0xFF);
+            reg(rex, REX3_XYENDI,    xy(3, 0));
+            reg(rex, REX3_XYSTARTI,  xy(0, 0));
+        };
+
+        // Interpreter HOSTR read
+        let rex_i = make_rex3();
+        rex3init(rex_i);
+        setup_read(rex_i);
+        reg_go(rex_i, REX3_DRAWMODE0, dm0_read); // triggers first batch
+        let word_interp = read_hostrw32_last(rex_i);
+
+        // JIT HOSTR read
+        let rex_j = make_rex3_jit();
+        rex3init(rex_j);
+        setup_read(rex_j);
+        reg_go(rex_j, REX3_DRAWMODE0, dm0_read); // triggers compile + first batch
+        if let Some(ref jit) = rex_j.rex_jit {
+            assert!(jit.wait_compiled(dm0_read, dm1),
+                "JIT compile failed dm0={dm0_read:#010x} dm1={dm1:#010x}");
+        }
+        // Re-run via JIT
+        rex3init(rex_j);
+        setup_read(rex_j);
+        reg_go(rex_j, REX3_DRAWMODE0, dm0_read);
+        let word_jit = read_hostrw32_last(rex_j);
+
+        assert_eq!(word_interp, word_jit,
+            "CI8 HOSTR JIT/interp mismatch: interp={word_interp:#010x} jit={word_jit:#010x}");
+    }
+
+    /// RGB24 HOSTR 32-bit: read 1 RGB24 pixel per word, multiple words.
+    /// Mirrors test_hostr_rgb24_read_block_32bit.
+    #[test]
+    fn jit_hostr_rgb24_block_32bit() {
+        let dm0_read = DRAWMODE0_OPCODE_READ | DRAWMODE0_ADRMODE_BLOCK | DM0_STOPONXY;
+        let dm1 = DM1_RGB24_HOSTRW;
+        let pixels_in: &[u32] = &[0x112233, 0x445566, 0x778899, 0xAABBCC];
+        let width = pixels_in.len() as i32;
+
+        // Fill pixels
+        let fill_rex = make_rex3();
+        rex3init(fill_rex);
+        reg(fill_rex, REX3_DRAWMODE1, DM1_RGB24_SRC);
+        reg(fill_rex, REX3_WRMASK, 0xFFFFFF);
+        for (x, &v) in pixels_in.iter().enumerate() {
+            reg(fill_rex, REX3_COLORRED,  v << 11 & !0x7FF | v >> 11 & 0x7FF); // use raw color
+        }
+        // Simpler: write fb_rgb directly
+        unsafe {
+            let fb = &mut *fill_rex.fb_rgb.get();
+            for (x, &v) in pixels_in.iter().enumerate() { fb[x] = v; }
+        }
+
+        let setup_read = |rex: &Rex3| {
+            unsafe {
+                let src = &*fill_rex.fb_rgb.get();
+                let dst = &mut *rex.fb_rgb.get();
+                dst[..width as usize].copy_from_slice(&src[..width as usize]);
+            }
+            reg(rex, REX3_DRAWMODE1, dm1);
+            reg(rex, REX3_WRMASK,    0xFFFFFF);
+            reg(rex, REX3_XYENDI,    xy(width - 1, 0));
+            reg(rex, REX3_XYSTARTI,  xy(0, 0));
+        };
+
+        let read_words = |rex: &Rex3| -> Vec<u32> {
+            setup_read(rex);
+            reg_go(rex, REX3_DRAWMODE0, dm0_read);
+            let mut words = Vec::new();
+            for i in 0..width {
+                let w = if i < width - 1 { read_hostrw32(rex) } else { read_hostrw32_last(rex) };
+                words.push(w);
+            }
+            words
+        };
+
+        let rex_i = make_rex3();
+        rex3init(rex_i);
+        let words_interp = read_words(rex_i);
+
+        let rex_j = make_rex3_jit();
+        rex3init(rex_j);
+        // Trigger compile
+        setup_read(rex_j);
+        reg_go(rex_j, REX3_DRAWMODE0, dm0_read);
+        read_hostrw32_last(rex_j); // drain
+        if let Some(ref jit) = rex_j.rex_jit {
+            assert!(jit.wait_compiled(dm0_read, dm1),
+                "JIT compile failed dm0={dm0_read:#010x} dm1={dm1:#010x}");
+        }
+        let words_jit = read_words(rex_j);
+
+        assert_eq!(words_interp, words_jit,
+            "RGB24 HOSTR JIT/interp mismatch:\n  interp={words_interp:08x?}\n  jit   ={words_jit:08x?}");
+    }
 }

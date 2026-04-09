@@ -26,7 +26,7 @@ use cranelift_module::{Linkage, Module};
 
 use crate::rex3::{
     Rex3Context,
-    DRAWMODE0_OPCODE_DRAW, DRAWMODE0_OPCODE_SCR2SCR,
+    DRAWMODE0_OPCODE_DRAW, DRAWMODE0_OPCODE_SCR2SCR, DRAWMODE0_OPCODE_READ,
     DRAWMODE0_ADRMODE_BLOCK, DRAWMODE0_ADRMODE_SPAN,
     DRAWMODE0_ADRMODE_I_LINE, DRAWMODE0_ADRMODE_F_LINE, DRAWMODE0_ADRMODE_A_LINE,
     DRAWMODE1_PLANES_RGB, DRAWMODE1_PLANES_RGBA,
@@ -68,18 +68,42 @@ impl Dm0 {
 
 struct Dm1 { val: u32 }
 impl Dm1 {
-    fn planes(&self)    -> u32  { self.val & 7 }
-    fn drawdepth(&self) -> u32  { (self.val >> 3) & 3 }
-    fn dblsrc(&self)    -> bool { self.val & (1 << 5) != 0 }
-    fn yflip(&self)     -> bool { self.val & (1 << 6) != 0 }
-    fn rgbmode(&self)   -> bool { self.val & (1 << 15) != 0 }
-    fn dither(&self)    -> bool { self.val & (1 << 16) != 0 }
-    fn fastclear(&self) -> bool { self.val & (1 << 17) != 0 }
-    fn blend(&self)     -> bool { self.val & (1 << 18) != 0 }
-    fn sfactor(&self)   -> u32  { (self.val >> 19) & 7 }
-    fn dfactor(&self)   -> u32  { (self.val >> 22) & 7 }
-    fn backblend(&self) -> bool { self.val & (1 << 25) != 0 }
-    fn logicop(&self)   -> u32  { (self.val >> 28) & 0xF }
+    fn planes(&self)      -> u32  { self.val & 7 }
+    fn drawdepth(&self)   -> u32  { (self.val >> 3) & 3 }
+    fn dblsrc(&self)      -> bool { self.val & (1 << 5) != 0 }
+    fn yflip(&self)       -> bool { self.val & (1 << 6) != 0 }
+    fn rwpacked(&self)    -> bool { self.val & (1 << 7) != 0 }
+    fn hostdepth(&self)   -> u32  { (self.val >> 8) & 3 }
+    fn rwdouble(&self)    -> bool { self.val & (1 << 10) != 0 }
+    fn swapendian(&self)  -> bool { self.val & (1 << 11) != 0 }
+    fn rgbmode(&self)     -> bool { self.val & (1 << 15) != 0 }
+    fn dither(&self)      -> bool { self.val & (1 << 16) != 0 }
+    fn fastclear(&self)   -> bool { self.val & (1 << 17) != 0 }
+    fn blend(&self)       -> bool { self.val & (1 << 18) != 0 }
+    fn sfactor(&self)     -> u32  { (self.val >> 19) & 7 }
+    fn dfactor(&self)     -> u32  { (self.val >> 22) & 7 }
+    fn backblend(&self)   -> bool { self.val & (1 << 25) != 0 }
+    fn logicop(&self)     -> u32  { (self.val >> 28) & 0xF }
+
+    /// Compute compile-time host pixel count (pixels per host word) from dm1 fields.
+    /// Mirrors Rex3::host_setup() count logic.
+    fn host_count(&self) -> u32 {
+        if !self.rwpacked() { return 1; }
+        let depth = self.hostdepth();
+        if self.rwdouble() {
+            match depth { 0 | 1 => 8, 2 => 4, 3 => 2, _ => 1 }
+        } else {
+            match depth { 0 | 1 => 4, 2 => 2, 3 => 1, _ => 1 }
+        }
+    }
+
+    /// Compute compile-time host shift amount (bits per slot).
+    /// Mirrors Rex3::host_setup() shift logic.
+    fn host_shift(&self) -> u32 {
+        if !self.rwpacked() { return 0; }
+        let depth = self.hostdepth();
+        match depth { 0 | 1 => 8, 2 => 16, 3 => 32, _ => 0 }
+    }
 }
 
 // ── Compiler ──────────────────────────────────────────────────────────────────
@@ -117,15 +141,20 @@ impl ShaderCompiler {
     {
         let dm0 = Dm0 { val: dm0_val };
 
-        // Only DRAW/SCR2SCR opcodes; SPAN, BLOCK, or I/F/A_LINE adrmode.
+        // DRAW/SCR2SCR/READ opcodes; SPAN, BLOCK, or I/F/A_LINE adrmode.
+        // Lines do not support host modes (READ/colorhost) — guard below.
         let opcode = dm0.opcode();
         let adrmode = dm0.adrmode() << 2; // match the <<2 convention from rex3.rs
-        let is_scr2scr = opcode == DRAWMODE0_OPCODE_SCR2SCR;
+        let is_scr2scr  = opcode == DRAWMODE0_OPCODE_SCR2SCR;
+        let is_hostr    = opcode == DRAWMODE0_OPCODE_READ;
+        let is_hostw    = opcode == DRAWMODE0_OPCODE_DRAW
+            && (dm0.colorhost() || dm0.alphahost());
         let is_line = adrmode == DRAWMODE0_ADRMODE_I_LINE
             || adrmode == DRAWMODE0_ADRMODE_F_LINE
             || adrmode == DRAWMODE0_ADRMODE_A_LINE;
-        if opcode != DRAWMODE0_OPCODE_DRAW && !is_scr2scr { return None; }
-        if dm0.colorhost() || dm0.alphahost() { return None; }
+        if opcode != DRAWMODE0_OPCODE_DRAW && !is_scr2scr && !is_hostr { return None; }
+        // Lines don't support host modes.
+        if is_line && (is_hostr || is_hostw) { return None; }
         if !is_line && adrmode != DRAWMODE0_ADRMODE_SPAN && adrmode != DRAWMODE0_ADRMODE_BLOCK {
             return None;
         }
@@ -169,7 +198,7 @@ impl ShaderCompiler {
                 &mut self.ctx.func,
                 &mut self.builder_ctx,
                 &dm0, &dm1,
-                is_scr2scr,
+                is_scr2scr, is_hostw, is_hostr,
                 ptr_type,
             )
         };
@@ -289,7 +318,7 @@ fn emit_calculate_src_address(
 /// Mirrors Rex3::calculate_fb_address.
 /// Emits xymove (unconditional for scr2scr, conditional on xyoffset for draw),
 /// xywin, smask clipping, bounds check.
-/// On clip/OOB miss: branches to `skip_block`.
+/// On clip/OOB miss: branches to `skip_block` with `skip_args`.
 /// On hit: falls through to a new `in_bounds` block and returns `(px_ptr, x_bayer, y_bayer)`.
 /// `x_bayer`/`y_bayer` are the window-relative coords (before xywin bias) — used for dither packing.
 fn emit_calculate_fb_address(
@@ -298,6 +327,7 @@ fn emit_calculate_fb_address(
     y_v:        Value,
     pctx:       &PixelCtx,
     skip_block: ir::Block,
+    skip_args:  &[Value],
     dm0:        &Dm0,
     dm1:        &Dm1,
     is_scr2scr: bool,
@@ -353,7 +383,7 @@ fn emit_calculate_fb_address(
         let sm0y_lo16  = b.ins().ireduce(types::I16, pctx.smask0y_v);
         let max_y0     = b.ins().sextend(types::I32, sm0y_lo16);
         let ok0 = and4_range(b, x_curr, y_curr, min_x0, max_x0, min_y0, max_y0);
-        b.ins().brif(ok0, pass0, &[], skip_block, &[]);
+        b.ins().brif(ok0, pass0, &[], skip_block, skip_args);
         b.switch_to_block(pass0); b.seal_block(pass0);
 
         // smasks 1-4: screen-absolute, OR-combined (any enabled mask that contains the pixel passes)
@@ -386,7 +416,7 @@ fn emit_calculate_fb_address(
             inside_any   = b.ins().bor(inside_any, contrib);
         }
         let inside = b.ins().icmp_imm(IntCC::NotEqual, inside_any, 0);
-        b.ins().brif(inside, after_clip, &[], skip_block, &[]);
+        b.ins().brif(inside, after_clip, &[], skip_block, skip_args);
     }
     b.switch_to_block(after_clip); b.seal_block(after_clip);
 
@@ -412,7 +442,7 @@ fn emit_calculate_fb_address(
         b.ins().bor(ab, cd)
     };
     let in_bounds = b.create_block();
-    b.ins().brif(oob, skip_block, &[], in_bounds, &[]);
+    b.ins().brif(oob, skip_block, skip_args, in_bounds, &[]);
     b.switch_to_block(in_bounds); b.seal_block(in_bounds);
 
     // Compute byte pointer into framebuffer
@@ -573,6 +603,8 @@ fn emit_shader(
     dm0: &Dm0,
     dm1: &Dm1,
     is_scr2scr: bool,
+    is_hostw: bool,    // DRAW + colorhost/alphahost: read pixels from ctx.hostrw_val
+    is_hostr: bool,    // READ opcode: pack fb pixels into ctx.hostrw_val
     ptr_type: ir::Type,
 ) -> bool {
     let mut b = FunctionBuilder::new(func, builder_ctx);
@@ -672,6 +704,7 @@ fn emit_shader(
     // [xstart: i32, ystart: i32, first: i8]
     // + shade state if shade enabled: [colorred: i32, colorgrn: i32, colorblue: i32, coloralpha: i32]
     // + pattern state: [zpat_bit: i8, pat_bit: i8, lsmode: i32]
+    // + host state if hostw/hostr: [host_shifter: i64]
     b.append_block_param(loop_header, types::I32); // xstart
     b.append_block_param(loop_header, types::I32); // ystart
     b.append_block_param(loop_header, types::I8);  // first flag
@@ -687,6 +720,9 @@ fn emit_shader(
     if dm0.enlspattern() {
         b.append_block_param(loop_header, types::I8);  // pat_bit
         b.append_block_param(loop_header, types::I32); // lsmode
+    }
+    if is_hostw || is_hostr {
+        b.append_block_param(loop_header, types::I64); // host_shifter
     }
 
     // Initial values for loop entry
@@ -719,6 +755,55 @@ fn emit_shader(
         None
     };
 
+    // host_count: compile-time number of pixels per host word (from dm1 fields).
+    // For host mode the loop stops after host_count pixels (one word), like stop_on_word.
+    // We compute an xstop analogous to length32 for this.
+    let host_count = if is_hostw || is_hostr { dm1.host_count() } else { 0 };
+    let host_xstop_v: Option<Value> = if (is_hostw || is_hostr) && host_count > 1 {
+        // Stop after host_count pixels: xstop = xstart + host_count * stepx
+        let offset = b.ins().iconst(types::I32, (host_count as i64) << 11);
+        let offset_neg = b.ins().iconst(types::I32, -((host_count as i64) << 11));
+        let step_hc = b.ins().select(x_dec_v, offset_neg, offset);
+        Some(b.ins().iadd(xstart_init, step_hc))
+    } else if (is_hostw || is_hostr) && host_count == 1 {
+        // Single pixel per word: loop runs once then x_end_reached exits naturally,
+        // but we also need stoponx to be true (below). Use xstop set to xstart+stepx
+        // (same as next pixel) so cont_x_block immediately stops.
+        Some(b.ins().iadd(xstart_init, stepx_v))
+    } else {
+        None
+    };
+
+    // Initial host shifter: for HOSTW load hostrw_val; for HOSTR start at 0.
+    // Note: hostrw_val was populated by execute_go from self.hostrw before calling us.
+    // Apply swapendian at shader entry if needed (compile-time constant from dm1).
+    let host_shifter_init: Value = if is_hostw {
+        let raw = {
+            let hi = b.ins().load(types::I64, mem, ctx_ptr,
+                ir::immediates::Offset32::new(ctx_off!(hostrw_val) as i32));
+            hi
+        };
+        if dm1.swapendian() {
+            if dm1.rwdouble() {
+                // swap all 8 bytes
+                emit_bswap64(&mut b, raw)
+            } else {
+                // swap only the high 32-bit word (32-bit write lands in [63:32])
+                let hi32 = b.ins().ushr_imm(raw, 32);
+                let hi32_i32 = b.ins().ireduce(types::I32, hi32);
+                let hi32_swap = emit_bswap32(&mut b, hi32_i32);
+                let hi32_ext = b.ins().uextend(types::I64, hi32_swap);
+                let lo32 = b.ins().band_imm(raw, 0xFFFF_FFFFi64);
+                let hi32_shifted = b.ins().ishl_imm(hi32_ext, 32);
+                b.ins().bor(hi32_shifted, lo32)
+            }
+        } else { raw }
+    } else if is_hostr {
+        b.ins().iconst(types::I64, 0)
+    } else {
+        b.ins().iconst(types::I64, 0)
+    };
+
     let mut init_args: Vec<Value> = vec![xstart_init, ystart_init, first_init];
     if dm0.shade() {
         let cr = ld32!(ctx_off!(colorred));
@@ -736,6 +821,9 @@ fn emit_shader(
         let lsm = ld32!(ctx_off!(lsmode));
         init_args.push(pb);
         init_args.push(lsm);
+    }
+    if is_hostw || is_hostr {
+        init_args.push(host_shifter_init);
     }
 
     // Set mid_primitive = 1 before entering loop
@@ -783,6 +871,12 @@ fn emit_shader(
         let lsm = b.ins().iconst(types::I32, 0);
         (pb, lsm)
     };
+    let host_shifter_v: Value = if is_hostw || is_hostr {
+        let v = hp[param_idx]; param_idx += 1; v
+    } else {
+        b.ins().iconst(types::I64, 0)
+    };
+    let _ = param_idx;
 
     // x = xstart >> 11, y = ystart >> 11
     let x_v = b.ins().sshr(xstart_v, c11);
@@ -829,17 +923,23 @@ fn emit_shader(
         do_pixel
     };
 
-    // Jump to loop_body if do_pixel, else skip to loop_next_x
+    // skip_block carries the updated host_shifter when in host mode.
+    // This is necessary because clipped pixels still consume a host shifter slot
+    // (fetch_host_pixel is called before calculate_fb_address in the interpreter).
     let pixel_block = b.create_block();
     let skip_block  = b.create_block();
-    // Both continue to loop_next_x with the same args
-    let continue_block = loop_next_x;
+    if is_hostw || is_hostr {
+        b.append_block_param(skip_block, types::I64); // host_shifter (updated)
+    }
 
     // Branch: do_pixel is I1 (from bnot/icmp) or I8 constant 1.
-    // Use brif directly — it accepts I1 or any integer type.
-    b.ins().brif(do_pixel, pixel_block, &[], skip_block, &[]);
+    // On skip (skipfirst/skiplast): host shifter is NOT advanced (proc_fn is not called).
+    let skip_init_args: &[Value] = if is_hostw || is_hostr {
+        std::slice::from_ref(&host_shifter_v)
+    } else { &[] };
+    b.ins().brif(do_pixel, pixel_block, &[], skip_block, skip_init_args);
 
-    // ── pixel_block: compute address and draw ─────────────────────────────────
+    // ── pixel_block: fetch host pixel (if any), compute address, draw ─────────
     b.switch_to_block(pixel_block);
     b.seal_block(pixel_block);
 
@@ -850,54 +950,82 @@ fn emit_shader(
         fb_rgb, fb_aux,
     };
 
+    // For HOSTW: fetch the host pixel BEFORE calculate_fb_address (mirrors interpreter:
+    // fetch_host_pixel is called at the top of process_pixel_draw, before the address calc).
+    // Clipped pixels still advance the host shifter.
+    // For HOSTR: similarly, store_host_pixel is called after address calc — but hostcnt
+    // is checked first. We pre-advance for HOSTR too so the count stays in sync.
+    // Actually for HOSTR: the pixel is read from fb then packed — we need the address first.
+    // We handle HOSTW fetch before address, HOSTR pack after address.
+    let (host_pixel_v, host_shifter_after_fetch) = if is_hostw {
+        emit_fetch_host_pixel_ir(&mut b, host_shifter_v, dm1)
+    } else {
+        let z = b.ins().iconst(types::I32, 0);
+        (z, host_shifter_v)
+    };
+
+    // skip_args for clipped pixels: pass the (possibly already advanced by fetch) shifter.
+    // For HOSTR: clip doesn't advance the shifter (store_host_pixel not called on clip).
+    // For HOSTW: clip DOES advance (fetch happens before address calc in interpreter).
+    let clip_skip_args_buf: [Value; 1] = [host_shifter_after_fetch];
+    let clip_skip_args: &[Value] = if is_hostw || is_hostr {
+        &clip_skip_args_buf[..]
+    } else { &[] };
+
     let (px_ptr, x_bayer, y_bayer) = emit_calculate_fb_address(
-        &mut b, x_v, y_v, &pctx, skip_block, dm0, dm1, is_scr2scr,
+        &mut b, x_v, y_v, &pctx, skip_block, clip_skip_args, dm0, dm1, is_scr2scr,
         coord_bias, c0, c2048, ptr_type,
     );
 
     // depth_mask used by scr2scr src read and by emit_pixel_write.
     let depth_mask: i64 = match dm1.drawdepth() { 0 => 0xF, 1 => 0xFF, 2 => 0xFFF, _ => 0xFFFFFF };
 
-    // ── Source color ──────────────────────────────────────────────────────────
-    // Mirrors process_pixel_scr2scr (src from fb) vs process_pixel_draw (shade DDA / registers).
-    let src_color: Value = if is_scr2scr {
-        // Mirrors calculate_src_address + expand(rd(src_addr)).
-        // src_oob: src pixel out of bounds → use 0 as source, still write dst.
-        let src_oob    = b.create_block();
-        let src_valid  = b.create_block();
-        b.append_block_param(src_valid, types::I32); // raw_src value
-        let src_ptr = emit_calculate_src_address(
-            &mut b, x_v, y_v, &pctx, src_oob, dm1, coord_bias, c0, c2048,
-        );
-        // In-bounds: read fb_rgb and expand (matches expand_fn(rd_fn(src_addr))).
-        let src_raw = b.ins().load(types::I32, memv, src_ptr, ir::immediates::Offset32::new(0));
-        let src_masked = b.ins().band_imm(src_raw, depth_mask as i64);
-        let src_expanded = if dm1.rgbmode() && dm1.drawdepth() != 3 {
-            emit_expand_ir(&mut b, src_masked, dm1.drawdepth())
-        } else {
-            src_masked
-        };
-        b.ins().jump(src_valid, &[src_expanded]);
-        // Out-of-bounds: source = 0.
-        b.switch_to_block(src_oob); b.seal_block(src_oob);
-        let zero = b.ins().iconst(types::I32, 0);
-        b.ins().jump(src_valid, &[zero]);
-        b.switch_to_block(src_valid); b.seal_block(src_valid);
-        b.block_params(src_valid).to_vec()[0]
+    // ── HOSTR (READ opcode): read fb pixel, pack into host shifter, jump to skip ──
+    // Mirrors process_pixel_read: calculate_fb_address + expand + store_host_pixel.
+    // No fb write; jump to skip_block with updated shifter.
+    let new_shifter_after_pixel: Value = if is_hostr {
+        let fb_raw = b.ins().load(types::I32, memv, px_ptr, ir::immediates::Offset32::new(0));
+        let depth_mask_i: i64 = match dm1.drawdepth() { 0 => 0xF, 1 => 0xFF, 2 => 0xFFF, _ => 0xFFFFFF };
+        let masked = b.ins().band_imm(fb_raw, depth_mask_i);
+        let expanded = if dm1.rgbmode() && dm1.drawdepth() != 3 {
+            emit_expand_ir(&mut b, masked, dm1.drawdepth())
+        } else { masked };
+        let new_s = emit_pack_host_pixel_ir(&mut b, host_shifter_after_fetch, expanded, dm1);
+        b.ins().jump(skip_block, &[new_s]);
+        new_s // unreachable but satisfies type checker
     } else {
-        // Mirrors process_pixel_draw source resolution.
-        let raw_src = if dm0.shade() {
-            // combine_host_dda: RGB clamp per component
-            let r  = clamp_color_component(&mut b, colorred_v);
-            let g  = clamp_color_component(&mut b, colorgrn_v);
-            let bl = clamp_color_component(&mut b, colorblue_v);
-            let g8   = b.ins().ishl_imm(g, 8);
-            let bl16 = b.ins().ishl_imm(bl, 16);
-            let rb   = b.ins().bor(r, g8);
-            b.ins().bor(rb, bl16)
+        // ── Source color ──────────────────────────────────────────────────────
+        let src_color = if is_scr2scr {
+            let src_oob    = b.create_block();
+            let src_valid  = b.create_block();
+            b.append_block_param(src_valid, types::I32);
+            let src_ptr = emit_calculate_src_address(
+                &mut b, x_v, y_v, &pctx, src_oob, dm1, coord_bias, c0, c2048,
+            );
+            let src_raw = b.ins().load(types::I32, memv, src_ptr, ir::immediates::Offset32::new(0));
+            let src_masked = b.ins().band_imm(src_raw, depth_mask as i64);
+            let src_expanded = if dm1.rgbmode() && dm1.drawdepth() != 3 {
+                emit_expand_ir(&mut b, src_masked, dm1.drawdepth())
+            } else { src_masked };
+            b.ins().jump(src_valid, &[src_expanded]);
+            b.switch_to_block(src_oob); b.seal_block(src_oob);
+            let zero = b.ins().iconst(types::I32, 0);
+            b.ins().jump(src_valid, &[zero]);
+            b.switch_to_block(src_valid); b.seal_block(src_valid);
+            b.block_params(src_valid).to_vec()[0]
         } else {
-            // Solid color from colorred (CI) or colorred/grn/blue (RGB)
-            if dm1.rgbmode() {
+            // DRAW path (possibly HOSTW): resolve source color from DDA / host pixel.
+            let raw_src = if dm0.shade() {
+                let r  = clamp_color_component(&mut b, colorred_v);
+                let g  = clamp_color_component(&mut b, colorgrn_v);
+                let bl = clamp_color_component(&mut b, colorblue_v);
+                let g8   = b.ins().ishl_imm(g, 8);
+                let bl16 = b.ins().ishl_imm(bl, 16);
+                let rb   = b.ins().bor(r, g8);
+                b.ins().bor(rb, bl16)
+            } else if is_hostw && dm0.colorhost() {
+                host_pixel_v
+            } else if dm1.rgbmode() {
                 let r  = ld32!(ctx_off!(colorred));
                 let g  = ld32!(ctx_off!(colorgrn));
                 let bl = ld32!(ctx_off!(colorblue));
@@ -909,73 +1037,91 @@ fn emit_shader(
                 let rb   = b.ins().bor(r_c, g8);
                 b.ins().bor(rb, bl16)
             } else {
-                // CI mode: colorred >> 11
                 let cr = ld32!(ctx_off!(colorred));
                 b.ins().sshr(cr, c11)
+            };
+
+            // alphahost=1 (only): color from DDA, alpha from host_pixel bits[31:24]
+            let raw_src = if is_hostw && dm0.alphahost() && !dm0.colorhost() && dm1.rgbmode() {
+                let alpha24 = b.ins().band_imm(host_pixel_v, 0xFF00_0000u64 as i64);
+                let color24 = b.ins().band_imm(raw_src, 0x00FF_FFFFi64);
+                b.ins().bor(color24, alpha24)
+            } else { raw_src };
+
+            // Pattern checks (zpopaque/lsopaque can override src with colorback)
+            let draw_block = b.create_block();
+            b.append_block_param(draw_block, types::I8);
+            let mut cur_use_bg: Value = b.ins().iconst(types::I8, 0);
+
+            if dm0.enzpattern() {
+                let zp_block = b.create_block();
+                let zp_pass  = b.create_block();
+                b.append_block_param(zp_pass, types::I8);
+                let zpattern_v   = ld32!(ctx_off!(zpattern));
+                let zpat_bit32   = b.ins().uextend(types::I32, zpat_bit_v);
+                let zpat_shifted = b.ins().ushr(zpattern_v, zpat_bit32);
+                let bit_v  = b.ins().band_imm(zpat_shifted, 1);
+                let bit_set = b.ins().icmp_imm(IntCC::NotEqual, bit_v, 0);
+                b.ins().brif(bit_set, zp_pass, &[cur_use_bg], zp_block, &[]);
+                b.switch_to_block(zp_block); b.seal_block(zp_block);
+                if dm0.zpopaque() {
+                    let bg1 = b.ins().iconst(types::I8, 1);
+                    b.ins().jump(zp_pass, &[bg1]);
+                } else {
+                    // Pattern miss and not opaque: skip write but shifter was already advanced
+                    let skip_args_here: &[Value] = if is_hostw { &clip_skip_args_buf[..] } else { &[] };
+                    b.ins().jump(skip_block, skip_args_here);
+                }
+                b.switch_to_block(zp_pass); b.seal_block(zp_pass);
+                cur_use_bg = b.block_params(zp_pass).to_vec()[0];
             }
+
+            if dm0.enlspattern() {
+                let ls_block = b.create_block();
+                let ls_pass  = b.create_block();
+                b.append_block_param(ls_pass, types::I8);
+                let lspattern_v  = ld32!(ctx_off!(lspattern));
+                let pat_bit32    = b.ins().uextend(types::I32, pat_bit_v);
+                let lspat_shifted = b.ins().ushr(lspattern_v, pat_bit32);
+                let bit_v  = b.ins().band_imm(lspat_shifted, 1);
+                let bit_set = b.ins().icmp_imm(IntCC::NotEqual, bit_v, 0);
+                b.ins().brif(bit_set, ls_pass, &[cur_use_bg], ls_block, &[]);
+                b.switch_to_block(ls_block); b.seal_block(ls_block);
+                if dm0.lsopaque() {
+                    let bg1 = b.ins().iconst(types::I8, 1);
+                    b.ins().jump(ls_pass, &[bg1]);
+                } else {
+                    let skip_args_here: &[Value] = if is_hostw { &clip_skip_args_buf[..] } else { &[] };
+                    b.ins().jump(skip_block, skip_args_here);
+                }
+                b.switch_to_block(ls_pass); b.seal_block(ls_pass);
+                cur_use_bg = b.block_params(ls_pass).to_vec()[0];
+            }
+
+            b.ins().jump(draw_block, &[cur_use_bg]);
+            b.switch_to_block(draw_block); b.seal_block(draw_block);
+            let use_bg_flag = b.block_params(draw_block).to_vec()[0];
+            let use_bg_bool = b.ins().icmp_imm(IntCC::NotEqual, use_bg_flag, 0);
+            b.ins().select(use_bg_bool, colorback_v, raw_src)
         };
 
-        // Pattern check: may replace raw_src with colorback (zpopaque/lsopaque)
-        // or skip pixel entirely. draw_block carries use_bg_flag as a block param.
-        let draw_block = b.create_block();
-        b.append_block_param(draw_block, types::I8); // use_bg_flag
-        let mut cur_use_bg: Value = b.ins().iconst(types::I8, 0);
-
-        if dm0.enzpattern() {
-            let zp_block = b.create_block();
-            let zp_pass  = b.create_block();
-            b.append_block_param(zp_pass, types::I8);
-            let zpattern_v   = ld32!(ctx_off!(zpattern));
-            let zpat_bit32   = b.ins().uextend(types::I32, zpat_bit_v);
-            let zpat_shifted = b.ins().ushr(zpattern_v, zpat_bit32);
-            let bit_v  = b.ins().band_imm(zpat_shifted, 1);
-            let bit_set = b.ins().icmp_imm(IntCC::NotEqual, bit_v, 0);
-            b.ins().brif(bit_set, zp_pass, &[cur_use_bg], zp_block, &[]);
-            b.switch_to_block(zp_block); b.seal_block(zp_block);
-            if dm0.zpopaque() {
-                let bg1 = b.ins().iconst(types::I8, 1);
-                b.ins().jump(zp_pass, &[bg1]);
-            } else {
-                b.ins().jump(skip_block, &[]);
-            }
-            b.switch_to_block(zp_pass); b.seal_block(zp_pass);
-            cur_use_bg = b.block_params(zp_pass).to_vec()[0];
-        }
-
-        if dm0.enlspattern() {
-            let ls_block = b.create_block();
-            let ls_pass  = b.create_block();
-            b.append_block_param(ls_pass, types::I8);
-            let lspattern_v  = ld32!(ctx_off!(lspattern));
-            let pat_bit32    = b.ins().uextend(types::I32, pat_bit_v);
-            let lspat_shifted = b.ins().ushr(lspattern_v, pat_bit32);
-            let bit_v  = b.ins().band_imm(lspat_shifted, 1);
-            let bit_set = b.ins().icmp_imm(IntCC::NotEqual, bit_v, 0);
-            b.ins().brif(bit_set, ls_pass, &[cur_use_bg], ls_block, &[]);
-            b.switch_to_block(ls_block); b.seal_block(ls_block);
-            if dm0.lsopaque() {
-                let bg1 = b.ins().iconst(types::I8, 1);
-                b.ins().jump(ls_pass, &[bg1]);
-            } else {
-                b.ins().jump(skip_block, &[]);
-            }
-            b.switch_to_block(ls_pass); b.seal_block(ls_pass);
-            cur_use_bg = b.block_params(ls_pass).to_vec()[0];
-        }
-
-        b.ins().jump(draw_block, &[cur_use_bg]);
-        b.switch_to_block(draw_block); b.seal_block(draw_block);
-        let use_bg_flag = b.block_params(draw_block).to_vec()[0];
-        let use_bg_bool = b.ins().icmp_imm(IntCC::NotEqual, use_bg_flag, 0);
-        b.ins().select(use_bg_bool, colorback_v, raw_src)
+        emit_pixel_write(&mut b, px_ptr, x_bayer, y_bayer, src_color, &pctx, &mem, &memv, dm1);
+        let skip_args_after_write: &[Value] = if is_hostw { &clip_skip_args_buf[..] } else { &[] };
+        b.ins().jump(skip_block, skip_args_after_write);
+        host_shifter_after_fetch
     };
-
-    emit_pixel_write(&mut b, px_ptr, x_bayer, y_bayer, src_color, &pctx, &mem, &memv, dm1);
-    b.ins().jump(skip_block, &[]);
+    let _ = new_shifter_after_pixel; // value flows through skip_block param (current_shifter)
 
     // ── skip_block: shade + pattern advance, then check end-of-x ─────────────
     b.switch_to_block(skip_block);
     b.seal_block(skip_block);
+
+    // Extract updated host_shifter from skip_block param (carries through clip/skip paths).
+    let current_shifter: Value = if is_hostw || is_hostr {
+        b.block_params(skip_block).to_vec()[0]
+    } else {
+        b.ins().iconst(types::I64, 0)
+    };
 
     // Shade DDA step
     let (new_cr, new_cg, new_cb, new_ca) = if dm0.shade() {
@@ -1080,11 +1226,21 @@ fn emit_shader(
     let pat_bit_reset = b.ins().iconst(types::I8, 31);
     let zpat_bit_reset = b.ins().iconst(types::I8, 31);
 
+    // Host shifter resets at row boundary (host word spans one row, not across rows).
+    // For HOSTR at row end: emit send_host_word writeback then reset shifter.
+    // Since the loop runs exactly host_count pixels per GO call in host mode,
+    // row boundaries should only occur after a full word — shifter is already written back.
+    // We just reset current_shifter to 0 for the new row.
+    let host_shifter_row_reset = b.ins().iconst(types::I64, 0);
+
     if !stopony {
         // Span / block without stopony: primitive done after one row
         let zero8 = b.ins().iconst(types::I8, 0);
         st_bool!(ctx_off!(mid_primitive), zero8);
-        // Write back state
+        // For HOSTR: flush accumulated shifter to ctx.hostrw_val before returning.
+        if is_hostr {
+            emit_store_hostrw_val(&mut b, ctx_ptr, &mem, current_shifter, dm1);
+        }
         emit_writeback(&mut b, ctx_ptr, &mem, xsave_v, ystart_next,
             dm0, new_cr, new_cg, new_cb, new_ca, zpat_bit_reset, pat_bit_reset, new_lsmode);
         b.ins().jump(loop_end, &[]);
@@ -1101,6 +1257,9 @@ fn emit_shader(
         b.switch_to_block(y_done_block); b.seal_block(y_done_block);
         let zero8 = b.ins().iconst(types::I8, 0);
         st_bool!(ctx_off!(mid_primitive), zero8);
+        if is_hostr {
+            emit_store_hostrw_val(&mut b, ctx_ptr, &mem, current_shifter, dm1);
+        }
         emit_writeback(&mut b, ctx_ptr, &mem, xsave_v, ystart_next,
             dm0, new_cr, new_cg, new_cb, new_ca, zpat_bit_reset, pat_bit_reset, new_lsmode);
         b.ins().jump(loop_end, &[]);
@@ -1112,44 +1271,72 @@ fn emit_shader(
         if dm0.shade() { back_args.extend([new_cr, new_cg, new_cb, new_ca]); }
         if dm0.enzpattern() { back_args.push(zpat_bit_reset); }
         if dm0.enlspattern() { back_args.push(pat_bit_reset); back_args.push(new_lsmode); }
+        if is_hostw || is_hostr { back_args.push(host_shifter_row_reset); }
         b.ins().jump(loop_header, &back_args);
     }
 
-    // ── cont_x_block: not x_end — check stoponx ───────────────────────────────
+    // ── cont_x_block: not x_end — check stoponx / host_xstop ─────────────────
     b.switch_to_block(cont_x_block);
     b.seal_block(cont_x_block);
 
-    if !dm0.stoponx() {
-        // stoponx=0: after one x step we stop (span primitive, next GO continues)
+    macro_rules! make_back_args {
+        ($new_x:expr) => {{
+            let new_first_v = b.ins().iconst(types::I8, 0);
+            let mut args = vec![$new_x, ystart_v, new_first_v];
+            if dm0.shade() { args.extend([new_cr, new_cg, new_cb, new_ca]); }
+            if dm0.enzpattern() { args.push(new_zpat_bit); }
+            if dm0.enlspattern() { args.push(new_pat_bit); args.push(new_lsmode); }
+            if is_hostw || is_hostr { args.push(current_shifter); }
+            args
+        }};
+    }
+
+    // Mirrors interpreter: stoponx is forced true in host mode (stop_on_word || stoponx).
+    let effective_stoponx = dm0.stoponx() || is_hostw || is_hostr;
+
+    if !effective_stoponx {
+        // stoponx=0 and not host mode: after one x step we stop (span primitive, next GO continues).
         emit_writeback(&mut b, ctx_ptr, &mem, xstart_next, ystart_v,
             dm0, new_cr, new_cg, new_cb, new_ca, new_zpat_bit, new_pat_bit, new_lsmode);
         b.ins().jump(loop_end, &[]);
     } else {
         // stoponx=1: continue x loop — jump back to loop_header.
-        // But first check length32 xstop: if xstart_next >= xstop, stop the primitive.
-        let new_first = b.ins().iconst(types::I8, 0);
-        let mut back_args: Vec<Value> = vec![xstart_next, ystart_v, new_first];
-        if dm0.shade() { back_args.extend([new_cr, new_cg, new_cb, new_ca]); }
-        if dm0.enzpattern() { back_args.push(new_zpat_bit); }
-        if dm0.enlspattern() { back_args.push(new_pat_bit); back_args.push(new_lsmode); }
+        // Check host_xstop first (host_count pixels per word), then length32 xstop.
+        let back_args = make_back_args!(xstart_next);
 
+        // Collect all xstop checks into a chain: host_xstop takes priority, then length32.
+        // On stop: write back and jump to loop_end.
+        // On no stop: jump back to loop_header.
+        let mut stop_checks: Vec<Value> = Vec::new();
+        if let Some(hxstop) = host_xstop_v {
+            let at_inc = b.ins().icmp(IntCC::SignedGreaterThanOrEqual, xstart_next, hxstop);
+            let at_dec = b.ins().icmp(IntCC::SignedLessThanOrEqual,    xstart_next, hxstop);
+            stop_checks.push(b.ins().select(x_dec_v, at_dec, at_inc));
+        }
         if let Some(xstop) = xstop_v {
-            // length32: stop if xstart_next >= xstop (x_inc) or <= xstop (x_dec)
-            let at_xstop_inc = b.ins().icmp(IntCC::SignedGreaterThanOrEqual, xstart_next, xstop);
-            let at_xstop_dec = b.ins().icmp(IntCC::SignedLessThanOrEqual,    xstart_next, xstop);
-            let at_xstop = b.ins().select(x_dec_v, at_xstop_dec, at_xstop_inc);
-            let xstop_block = b.create_block();
-            let keep_going  = b.create_block();
-            b.ins().brif(at_xstop, xstop_block, &[], keep_going, &[]);
+            let at_inc = b.ins().icmp(IntCC::SignedGreaterThanOrEqual, xstart_next, xstop);
+            let at_dec = b.ins().icmp(IntCC::SignedLessThanOrEqual,    xstart_next, xstop);
+            stop_checks.push(b.ins().select(x_dec_v, at_dec, at_inc));
+        }
 
-            b.switch_to_block(xstop_block); b.seal_block(xstop_block);
+        if stop_checks.is_empty() {
+            b.ins().jump(loop_header, &back_args);
+        } else {
+            // Combine all stop conditions with OR
+            let any_stop = stop_checks.into_iter().reduce(|a, c| b.ins().bor(a, c)).unwrap();
+            let stop_block = b.create_block();
+            let keep_going = b.create_block();
+            b.ins().brif(any_stop, stop_block, &[], keep_going, &[]);
+
+            b.switch_to_block(stop_block); b.seal_block(stop_block);
+            if is_hostr {
+                emit_store_hostrw_val(&mut b, ctx_ptr, &mem, current_shifter, dm1);
+            }
             emit_writeback(&mut b, ctx_ptr, &mem, xstart_next, ystart_v,
                 dm0, new_cr, new_cg, new_cb, new_ca, new_zpat_bit, new_pat_bit, new_lsmode);
             b.ins().jump(loop_end, &[]);
 
             b.switch_to_block(keep_going); b.seal_block(keep_going);
-            b.ins().jump(loop_header, &back_args);
-        } else {
             b.ins().jump(loop_header, &back_args);
         }
     }
@@ -1421,9 +1608,9 @@ fn emit_draw_iline(
         fb_rgb, fb_aux,
     };
 
-    // Lines never use scr2scr (dst only, no xymove for draw; xyoffset still applies)
+    // Lines never use scr2scr or host mode (guarded in compile_shader)
     let (px_ptr, x_bayer, y_bayer) = emit_calculate_fb_address(
-        &mut b, x_v, y_v, &pctx, skip_block, dm0, dm1, /*is_scr2scr=*/false,
+        &mut b, x_v, y_v, &pctx, skip_block, &[], dm0, dm1, /*is_scr2scr=*/false,
         coord_bias, c0, c2048, ptr_type,
     );
 
@@ -2227,4 +2414,182 @@ fn emit_blend_ir(b: &mut FunctionBuilder, src: Value, dst: Value, sfactor: u32, 
     let t1 = b.ins().bor(r_out, g_out);
     let t2 = b.ins().bor(t1, b_out);
     b.ins().bor(t2, a_out)
+}
+
+// ── Host FIFO IR helpers ──────────────────────────────────────────────────────
+
+/// Emit a byte-swap of a 32-bit value (rev8 semantics).
+/// Mirrors u32::swap_bytes().
+fn emit_bswap32(b: &mut FunctionBuilder, val: Value) -> Value {
+    // Swap: byte0 and byte3, byte1 and byte2.
+    // result = ((v & 0xFF) << 24) | ((v & 0xFF00) << 8) | ((v >> 8) & 0xFF00) | ((v >> 24) & 0xFF)
+    let b0   = b.ins().band_imm(val, 0xFF);
+    let b0s  = b.ins().ishl_imm(b0, 24);
+    let b1   = b.ins().ushr_imm(val, 8);
+    let b1m  = b.ins().band_imm(b1, 0xFF);
+    let b1s  = b.ins().ishl_imm(b1m, 16);
+    let b2   = b.ins().ushr_imm(val, 16);
+    let b2m  = b.ins().band_imm(b2, 0xFF);
+    let b2s  = b.ins().ishl_imm(b2m, 8);
+    let b3   = b.ins().ushr_imm(val, 24);
+    let b3m  = b.ins().band_imm(b3, 0xFF);
+    let r1   = b.ins().bor(b0s, b1s);
+    let r2   = b.ins().bor(b2s, b3m);
+    b.ins().bor(r1, r2)
+}
+
+/// Emit a byte-swap of a 64-bit value (rev8 semantics).
+/// Mirrors u64::swap_bytes().
+fn emit_bswap64(b: &mut FunctionBuilder, val: Value) -> Value {
+    // Swap each byte: bytes 0..7 → 7..0.
+    let mask = b.ins().iconst(types::I64, 0xFF);
+    let mut bytes = [b.ins().iconst(types::I64, 0); 8];
+    for i in 0u32..8 {
+        let shifted = if i == 0 { val } else { b.ins().ushr_imm(val, (i * 8) as i64) };
+        bytes[i as usize] = b.ins().band(shifted, mask);
+    }
+    // Reassemble in reversed order
+    let mut result = bytes[7]; // byte7 → position 0 (shift 0)
+    for i in (0u32..7).rev() {
+        let dest_shift = (7 - i) * 8;
+        let placed = b.ins().ishl_imm(bytes[i as usize], dest_shift as i64);
+        result = b.ins().bor(result, placed);
+    }
+    result
+}
+
+/// Emit IR to extract one pixel from the MSB of the host shifter and advance it.
+/// Mirrors Rex3::fetch_host_pixel (after initial load+swapendian, which is done at shader entry).
+///
+/// Returns `(pixel_24bit: Value, new_shifter: Value)`.
+/// - `pixel_24bit`: 24-bit BGR value (expanded from hostdepth format).
+/// - `new_shifter`:  shifter after shifting left by host_shift bits.
+///
+/// hostdepth meaning:
+///   0 = 4bpp nibble in bits[63:60] (8-bit slot, shift=8, mask=0xF)
+///   1 = 8bpp byte  in bits[63:56] (8-bit slot, shift=8, mask=0xFF)
+///   2 = 12bpp word in bits[63:48] (16-bit slot, shift=16, mask=0xFFF)
+///   3 = 32bpp word in bits[63:32] (32-bit slot, shift=32, mask=0xFFFFFFFF)
+fn emit_fetch_host_pixel_ir(
+    b:   &mut FunctionBuilder,
+    shifter: Value, // I64
+    dm1: &Dm1,
+) -> (Value, Value) {
+    let host_shift = dm1.host_shift();
+    let hostdepth  = dm1.hostdepth();
+
+    // Extract pixel from MSB of shifter based on hostdepth.
+    // Non-packed (host_shift=0): the entire 32-bit value is in bits[63:32].
+    let (pixel_raw, new_shifter) = if !dm1.rwpacked() {
+        // Non-packed: one pixel per word, occupies high 32 bits.
+        let hi32  = b.ins().ushr_imm(shifter, 32);
+        let pixel = b.ins().ireduce(types::I32, hi32);
+        // Shift doesn't matter for non-packed (only one pixel), but advance anyway.
+        let shifted = b.ins().ishl_imm(shifter, 32);
+        (pixel, shifted)
+    } else {
+        let pixel_raw: Value = match hostdepth {
+            0 => {
+                // 4bpp: bits[63:60] → 4-bit value
+                let hi = b.ins().ushr_imm(shifter, 60);
+                b.ins().ireduce(types::I32, hi)
+            }
+            1 => {
+                // 8bpp: bits[63:56] → 8-bit value
+                let hi = b.ins().ushr_imm(shifter, 56);
+                b.ins().ireduce(types::I32, hi)
+            }
+            2 => {
+                // 12bpp: bits[63:48] → 12-bit value
+                let hi = b.ins().ushr_imm(shifter, 48);
+                let r  = b.ins().ireduce(types::I32, hi);
+                b.ins().band_imm(r, 0xFFF)
+            }
+            _ => {
+                // 32bpp: bits[63:32]
+                let hi = b.ins().ushr_imm(shifter, 32);
+                b.ins().ireduce(types::I32, hi)
+            }
+        };
+        let shift_amt = b.ins().iconst(types::I64, host_shift as i64);
+        let shifted = b.ins().ishl(shifter, shift_amt);
+        (pixel_raw, shifted)
+    };
+
+    // Expand from host depth to 24-bit BGR if rgbmode, else pass through as CI index.
+    let pixel_24 = if dm1.rgbmode() {
+        match hostdepth {
+            0 => emit_expand_ir(b, pixel_raw, 0),  // 4bpp → 24bit
+            1 => emit_expand_ir(b, pixel_raw, 1),  // 8bpp → 24bit
+            2 => emit_expand_ir(b, pixel_raw, 2),  // 12bpp → 24bit
+            _ => pixel_raw,                         // 32bpp: already 24-bit (high byte = alpha)
+        }
+    } else {
+        pixel_raw // CI index: return as-is
+    };
+
+    (pixel_24, new_shifter)
+}
+
+/// Emit IR to compress one pixel and pack it into the accumulator shifter.
+/// Mirrors Rex3::store_host_pixel (the pack step only; send_host_word is emitted separately at loop end).
+///
+/// Returns `new_shifter: Value` (I64).
+///
+/// Pack: `acc = (acc << host_shift) | compressed_pixel`
+fn emit_pack_host_pixel_ir(
+    b:       &mut FunctionBuilder,
+    acc:     Value, // I64
+    pixel:   Value, // I32, 24-bit BGR (for rgbmode) or CI index
+    dm1:     &Dm1,
+) -> Value {
+    let host_shift = dm1.host_shift();
+    let hostdepth  = dm1.hostdepth();
+
+    // Compress pixel to hostdepth format (rgbmode → compress, CI → mask).
+    let compressed_i32: Value = if dm1.rgbmode() {
+        match hostdepth {
+            0 => emit_compress_ir(b, pixel, 0, false),  // 24bit → 4bpp (no dither for host)
+            1 => emit_compress_ir(b, pixel, 1, false),  // 24bit → 8bpp
+            2 => emit_compress_ir(b, pixel, 2, false),  // 24bit → 12bpp
+            _ => b.ins().bor_imm(pixel, 0xFF000000u32 as i64), // 32bpp: set alpha=0xFF (compress_32_rgb)
+        }
+    } else {
+        // CI mode: mask to depth
+        let mask: i64 = match hostdepth { 0 => 0xF, 1 => 0xFF, 2 => 0xFFF, _ => 0xFFFFFFFF };
+        b.ins().band_imm(pixel, mask)
+    };
+
+    // Pack: acc = (acc << shift) | compressed
+    let compressed_i64 = b.ins().uextend(types::I64, compressed_i32);
+    if !dm1.rwpacked() || host_shift == 0 {
+        // Non-packed: single pixel, just put in low 32 bits.
+        compressed_i64
+    } else {
+        let shift_amt = b.ins().iconst(types::I64, host_shift as i64);
+        let acc_shifted = b.ins().ishl(acc, shift_amt);
+        b.ins().bor(acc_shifted, compressed_i64)
+    }
+}
+
+/// Emit IR to apply send_host_word semantics and store to ctx.hostrw_val.
+/// Mirrors Rex3::send_host_word: if swapendian → swap_bytes; else if !rwdouble → shift left 32.
+/// Used at loop exit for HOSTR mode.
+fn emit_store_hostrw_val(
+    b:       &mut FunctionBuilder,
+    ctx_ptr: Value,
+    mem:     &MemFlags,
+    shifter: Value, // I64: accumulated packed pixels
+    dm1:     &Dm1,
+) {
+    let val = if dm1.swapendian() {
+        emit_bswap64(b, shifter)
+    } else if !dm1.rwdouble() {
+        // 32-bit mode: shift left 32 to align data to high half
+        b.ins().ishl_imm(shifter, 32)
+    } else {
+        shifter
+    };
+    b.ins().store(*mem, val, ctx_ptr,
+        ir::immediates::Offset32::new(ctx_off!(hostrw_val) as i32));
 }

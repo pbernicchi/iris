@@ -725,6 +725,9 @@ pub struct Rex3Context {
     pub clipmode: u32,
     pub host_shifter: u64,
     pub hostcnt: u32,
+    /// Bridge for JIT shaders: copy of Rex3::hostrw loaded before JIT dispatch (HOSTW/READ).
+    /// For READ, the JIT writes packed pixels here; execute_go copies it back to Rex3::hostrw.
+    pub hostrw_val: u64,
     /// Bit index (31..=0) for lspattern with lsmode repeat/length; reset to 31 at GO start and each new row.
     pub pat_bit: u8,
     /// Bit index (31..=0) for zpattern; always 32-bit repeating, reset to 31 at GO start and each new row.
@@ -3030,10 +3033,10 @@ impl Rex3 {
                 let is_line = adrmode == DRAWMODE0_ADRMODE_I_LINE
                     || adrmode == DRAWMODE0_ADRMODE_F_LINE
                     || adrmode == DRAWMODE0_ADRMODE_A_LINE;
-                let is_jittable = (opcode == DRAWMODE0_OPCODE_DRAW || opcode == DRAWMODE0_OPCODE_SCR2SCR)
-                    && (adrmode == DRAWMODE0_ADRMODE_BLOCK || adrmode == DRAWMODE0_ADRMODE_SPAN || is_line)
-                    && !ctx.drawmode0.colorhost()
-                    && !ctx.drawmode0.alphahost();
+                let is_jittable = (opcode == DRAWMODE0_OPCODE_DRAW
+                        || opcode == DRAWMODE0_OPCODE_SCR2SCR
+                        || opcode == DRAWMODE0_OPCODE_READ)
+                    && (adrmode == DRAWMODE0_ADRMODE_BLOCK || adrmode == DRAWMODE0_ADRMODE_SPAN || is_line);
                 if is_jittable {
                     // Fast path: same (dm0, dm1) as last GO — skip the HashMap lookup.
                     // Last-hit cache: skip HashMap lookup when (dm0,dm1) unchanged.
@@ -3051,7 +3054,13 @@ impl Rex3 {
                     if let Some(entry) = entry {
                         let fb_rgb = unsafe { (*self.fb_rgb.get()).as_mut_ptr() };
                         let fb_aux = unsafe { (*self.fb_aux.get()).as_mut_ptr() };
+                        // Bridge hostrw: populate ctx.hostrw_val before call so HOSTW shaders
+                        // can fetch pixels from it; copy back after for READ shaders.
+                        ctx.hostrw_val = self.hostrw.load(Ordering::Relaxed);
                         unsafe { entry(ctx as *mut Rex3Context, fb_rgb, fb_aux); }
+                        if opcode == DRAWMODE0_OPCODE_READ {
+                            self.hostrw.store(ctx.hostrw_val, Ordering::Relaxed);
+                        }
                         self.jit_go_count.fetch_add(1, Ordering::Relaxed);
                         self.diag.fetch_and(!Self::DIAG_LOOP_EXECUTE_GO, Ordering::Relaxed);
                         return;
