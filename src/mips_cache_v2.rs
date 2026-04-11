@@ -548,6 +548,39 @@ impl<const SIZE: usize, const LINE: usize, const KIND: u8,
         let arr = self.data_mut();
         unsafe { std::slice::from_raw_parts_mut(arr.as_mut_ptr() as *mut u8, SIZE) }
     }
+
+    /// Read ACC bytes from the cache data array using a virtually-indexed address.
+    /// ACC must be 1, 2, 4, or 8. The full cache index is derived from
+    /// `virt_addr & (SIZE-1)`; the XOR corrects for big-endian packing within each u64.
+    #[inline(always)]
+    fn dc_read<const ACC: usize>(&self, virt_addr: u64) -> u64 {
+        let masked = (virt_addr as usize) & (SIZE - 1);
+        if ACC == 8 {
+            self.data()[masked >> 3]
+        } else if ACC == 4 {
+            self.data_as_words()[(masked >> 2) ^ 1] as u64
+        } else if ACC == 2 {
+            self.data_as_halves()[(masked >> 1) ^ 3] as u64
+        } else {
+            self.data_as_bytes()[masked ^ 7] as u64
+        }
+    }
+
+    /// Write ACC bytes into the cache data array using a virtually-indexed address.
+    /// ACC must be 1, 2, 4, or 8. Only the low ACC*8 bits of `val` are written.
+    #[inline(always)]
+    fn dc_write<const ACC: usize>(&self, virt_addr: u64, val: u64) {
+        let masked = (virt_addr as usize) & (SIZE - 1);
+        if ACC == 8 {
+            self.data_mut()[masked >> 3] = val;
+        } else if ACC == 4 {
+            self.data_as_words_mut()[(masked >> 2) ^ 1] = val as u32;
+        } else if ACC == 2 {
+            self.data_as_halves_mut()[(masked >> 1) ^ 3] = val as u16;
+        } else {
+            self.data_as_bytes_mut()[masked ^ 7] = val as u8;
+        }
+    }
 }
 
 // =============================================================================
@@ -1362,18 +1395,7 @@ impl MipsCache for R4000Cache {
         let s = self.ensure_l1d_line(virt_addr, phys_addr);
         if s != BUS_OK { return BusRead64 { status: s, data: 0 }; }
 
-        // Read from L1-D cache
-        let data_idx = self.dc.get_data_index(virt_addr);
-        let data = if SIZE == 1 {
-            self.dc.data_as_bytes()[data_idx * 8 + ((phys_addr as usize & 7) ^ 7)] as u64
-        } else if SIZE == 2 {
-            self.dc.data_as_halves()[data_idx * 4 + ((phys_addr as usize & 7) >> 1 ^ 3)] as u64
-        } else if SIZE == 4 {
-            self.dc.data_as_words()[data_idx * 2 + ((phys_addr as usize & 7) >> 2 ^ 1)] as u64
-        } else {
-            self.dc.data()[data_idx]
-        };
-        BusRead64::ok(data)
+        BusRead64::ok(self.dc.dc_read::<SIZE>(virt_addr))
     }
 
     fn write<const SIZE: usize>(&self, virt_addr: u64, phys_addr: u64, val: u64) -> u32 {
@@ -1398,19 +1420,7 @@ impl MipsCache for R4000Cache {
         if s != BUS_OK { return s; }
 
         // Write directly into the typed view — no RMW, no mask
-        let data_idx = self.dc.get_data_index(virt_addr);
-        if SIZE == 8 {
-            self.dc.data_mut()[data_idx] = val;
-        } else if SIZE == 4 {
-            let slot = (phys_addr as usize & 7) >> 2 ^ 1; // big-endian word within u64
-            self.dc.data_as_words_mut()[data_idx * 2 + slot] = val as u32;
-        } else if SIZE == 2 {
-            let slot = (phys_addr as usize & 7) >> 1 ^ 3; // big-endian half within u64
-            self.dc.data_as_halves_mut()[data_idx * 4 + slot] = val as u16;
-        } else {
-            let slot = (phys_addr as usize & 7) ^ 7;      // big-endian byte within u64
-            self.dc.data_as_bytes_mut()[data_idx * 8 + slot] = val as u8;
-        }
+        self.dc.dc_write::<SIZE>(virt_addr, val);
 
         self.mark_l1d_dirty(virt_addr);
         BUS_OK
@@ -1437,9 +1447,8 @@ impl MipsCache for R4000Cache {
         let s = self.ensure_l1d_line(virt_addr, phys_addr);
         if s != BUS_OK { return s; }
 
-        let data_idx = self.dc.get_data_index(virt_addr);
-        let dc_data = self.dc.data_mut();
-        dc_data[data_idx] = (dc_data[data_idx] & !mask) | (val & mask);
+        let current = self.dc.dc_read::<8>(virt_addr);
+        self.dc.dc_write::<8>(virt_addr, (current & !mask) | (val & mask));
 
         self.mark_l1d_dirty(virt_addr);
         BUS_OK
