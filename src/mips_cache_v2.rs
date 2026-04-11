@@ -641,7 +641,8 @@ unsafe impl Sync for R4000Cache {}
 
 // Type aliases for the concrete cache instances, for brevity in R4000Cache impls.
 // TAGS = SIZE/LINE (one tag per cache line), DATA = SIZE/8 (one u64 per 8 bytes).
-type ICache  = Cache<IC_SIZE, IC_LINE, { CacheKind::Insn as u8 }, { IC_SIZE / IC_LINE }, { IC_SIZE / 8 }>;
+// ICache DATA=0: no data storage — fetch() indexes l2.instrs directly from phys_addr.
+type ICache  = Cache<IC_SIZE, IC_LINE, { CacheKind::Insn as u8 }, { IC_SIZE / IC_LINE }, 0>;
 type DCache  = Cache<DC_SIZE, DC_LINE, { CacheKind::Data as u8 }, { DC_SIZE / DC_LINE }, { DC_SIZE / 8 }>;
 type L2Cache = Cache<L2_SIZE, L2_LINE, { CacheKind::L2   as u8 }, { L2_SIZE / L2_LINE }, { L2_SIZE / 8 }>;
 
@@ -1125,6 +1126,12 @@ impl R4000Cache {
         let l2_data = self.l2.data_mut();
         let start_chunk = l2_idx << L2Cache::CHUNKS_PER_LINE_SHIFT;
 
+        // INVARIANT: l2.data is always accessed as u64 chunks (never as u32 words).
+        // l2.instrs[n] corresponds to the instruction at byte offset n*4, derived by
+        // splitting each u64 chunk into (high=r0, low=r1) — r0 at i*2, r1 at i*2+1.
+        // fetch() uses ((phys_addr & (L2_SIZE-1)) >> 2) to index instrs directly,
+        // which is consistent with this layout. Do not add data_as_words() accessors
+        // on L2 or the fetch indexing will silently break.
         let instrs_start = l2_idx << L2Cache::INSTR_SHIFT;
         for i in 0..L2Cache::CHUNKS_PER_LINE {
             let fetch_addr = line_base + ((i as u64) << 3);
@@ -1203,20 +1210,6 @@ impl R4000Cache {
             if !self.fill_l2_line(phys_addr, index_addr) {
                 return exec_exception_const(EXC_IBE);
             }
-        }
-
-        // Store l2.instrs slot indices into ic.data (two u32 per u64, high=even, low=odd)
-        // Align to L1I line boundary before computing L2 word offset — phys_addr may
-        // point to any word within the line, not necessarily the first.
-        let ic_line_base = phys_addr & !(ICache::LINE_MASK as u64);
-        let l2_word_offset = ((ic_line_base as usize) & L2Cache::LINE_MASK) >> 2;
-        let l2_instrs_base = (l2_idx << L2Cache::INSTR_SHIFT) + l2_word_offset;
-        let ic_data = self.ic.data_mut();
-        let ic_data_base = ic_idx * ICache::CHUNKS_PER_LINE;
-        for i in 0..ICache::CHUNKS_PER_LINE {
-            let idx0 = (l2_instrs_base + i * 2    ) as u32;
-            let idx1 = (l2_instrs_base + i * 2 + 1) as u32;
-            ic_data[ic_data_base + i] = ((idx0 as u64) << 32) | (idx1 as u64);
         }
 
         // Set tag with Valid bit
@@ -1363,12 +1356,12 @@ impl MipsCache for R4000Cache {
             self.l1i_hit_count.fetch_add(1, Ordering::Relaxed);
         }
 
-        // Return pointer to the DecodedInstr slot in l2.instrs.
-        // ic.data_as_words() gives a flat &[u32] view; XOR word index with 1 accounts
-        // for the big-endian packing ((idx0<<32)|idx1) on a little-endian host.
-        let word_offset = ((phys_addr as usize) & ICache::LINE_MASK) >> 2;
-        let l2_slot_idx = self.ic.data_as_words()
-            [((ic_idx << ICache::INSTR_SHIFT) + word_offset) ^ 1] as usize;
+        // Index directly into l2.instrs using phys_addr masked to L2 size.
+        // >> 2 converts byte address to instruction word index.
+        // l2.instrs[n] holds the n-th instruction word — no endian XOR here
+        // (the ^ 1 only applies when reading raw u32 words from the u64 data array).
+        let l2_slot_idx = ((phys_addr as usize) & (L2_SIZE - 1)) >> 2;
+
         let slot = &self.l2.instrs.get()[l2_slot_idx] as *const DecodedInstr;
         FetchInstrResult::hit(slot)
     }
@@ -1804,18 +1797,29 @@ impl MipsCache for R4000Cache {
                 }
                 let tag: L1ITag = self.ic.get_tag(idx);
 
-                // Decoded slots live in L2 — look up via ic.data indices.
+                // Decoded slots live in l2.instrs, indexed directly by physical word address.
+                // Reconstruct physical base from ptag + line index, then index l2.instrs.
+                // Also read the raw u32 from l2.data (via u64 chunks) and flag any mismatch.
                 let instrs_per_ic_line = ICache::INSTRS_PER_LINE;
                 let ic_instrs = self.l2.instrs.get();
-
+                let l2_data = self.l2.data();
+                let phys_base = ((tag.ptag() as usize) << ICache::CACHE_SIZE_SHIFT)
+                    | (idx << ICache::LINE_SHIFT);
+                let l2_slot_base = (phys_base & (L2_SIZE - 1)) >> 2;
                 let mut s = format!("L1-I Line 0x{:x}: Tag=0x{:06x} V={}\n  Instrs:", idx, tag.ptag(), tag.valid());
-                let ic_data_words = self.ic.data_as_words();
-                let ic_instrs_base = idx << ICache::INSTR_SHIFT;
                 for i in 0..instrs_per_ic_line {
                     if i % 4 == 0 { s.push_str("\n    "); }
-                    let l2_slot_idx = ic_data_words[(ic_instrs_base + i) ^ 1] as usize;
+                    let l2_slot_idx = l2_slot_base + i;
                     if l2_slot_idx < ic_instrs.len() {
-                        s.push_str(&format!("{:08x} ", ic_instrs[l2_slot_idx].raw));
+                        let from_instrs = ic_instrs[l2_slot_idx].raw;
+                        // l2.data is u64 chunks; word i is high u32 of chunk i/2 if even, low if odd
+                        let chunk = l2_data[l2_slot_idx >> 1];
+                        let from_data = if l2_slot_idx & 1 == 0 { (chunk >> 32) as u32 } else { chunk as u32 };
+                        if from_instrs != from_data {
+                            s.push_str(&format!("{:08x}[DATA={:08x}!] ", from_instrs, from_data));
+                        } else {
+                            s.push_str(&format!("{:08x} ", from_instrs));
+                        }
                     }
                 }
                 s
@@ -1879,7 +1883,6 @@ impl MipsCache for R4000Cache {
 
     fn power_on(&self) {
         self.ic.tags_mut().fill(0);
-        self.ic.data_mut().fill(0);
         self.dc.tags_mut().fill(0);
         self.dc.data_mut().fill(0);
         self.l2.tags_mut().fill(0);
@@ -1916,7 +1919,6 @@ impl Drop for R4000Cache {
 impl Resettable for R4000Cache {
     fn power_on(&self) {
         self.ic.tags_mut().fill(0);
-        self.ic.data_mut().fill(0);
         self.dc.tags_mut().fill(0);
         self.dc.data_mut().fill(0);
         self.l2.tags_mut().fill(0);
@@ -1947,7 +1949,7 @@ impl R4000Cache {
     }
 
     pub fn save_cache_state(&self) -> toml::Value {
-        let (ic_tags, ic_data) = Self::save_cache_inner(&self.ic);
+        let (ic_tags, _) = Self::save_cache_inner(&self.ic);
         let (dc_tags, dc_data) = Self::save_cache_inner(&self.dc);
         let (l2_tags, l2_data) = Self::save_cache_inner(&self.l2);
         let llbit = unsafe { *self.llbit.get() };
@@ -1955,7 +1957,7 @@ impl R4000Cache {
 
         let mut t = toml::value::Table::new();
         t.insert("ic_tags".into(),  u32_slice_to_toml(&ic_tags));
-        t.insert("ic_data".into(),  u64_slice_to_toml(&ic_data));
+        // ic.data not saved — fetch() recomputes l2.instrs indices from phys_addr directly
         t.insert("dc_tags".into(),  u32_slice_to_toml(&dc_tags));
         t.insert("dc_data".into(),  u64_slice_to_toml(&dc_data));
         t.insert("l2_tags".into(),  u32_slice_to_toml(&l2_tags));
@@ -1967,21 +1969,19 @@ impl R4000Cache {
 
     pub fn load_cache_state(&self, v: &toml::Value) -> Result<(), String> {
         let mut ic_tags = vec![0u32; ICache::NUM_LINES];
-        let mut ic_data = vec![0u64; IC_SIZE / 8];
         let mut dc_tags = vec![0u32; DCache::NUM_LINES];
         let mut dc_data = vec![0u64; DC_SIZE / 8];
         let mut l2_tags = vec![0u32; L2Cache::NUM_LINES];
         let mut l2_data = vec![0u64; L2_SIZE / 8];
 
         if let Some(f) = get_field(v, "ic_tags") { load_u32_slice(f, &mut ic_tags); }
-        if let Some(f) = get_field(v, "ic_data") { load_u64_slice(f, &mut ic_data); }
+        // ic_data not loaded — fetch() recomputes l2.instrs indices from phys_addr directly
         if let Some(f) = get_field(v, "dc_tags") { load_u32_slice(f, &mut dc_tags); }
         if let Some(f) = get_field(v, "dc_data") { load_u64_slice(f, &mut dc_data); }
         if let Some(f) = get_field(v, "l2_tags") { load_u32_slice(f, &mut l2_tags); }
         if let Some(f) = get_field(v, "l2_data") { load_u64_slice(f, &mut l2_data); }
 
-        // Load ic tags and ic data (ic.data stores l2.instrs slot indices)
-        Self::load_cache_inner(&self.ic, &ic_tags, &ic_data);
+        Self::load_cache_inner(&self.ic, &ic_tags, &[][..]);
         Self::load_cache_inner(&self.dc, &dc_tags, &dc_data);
         Self::load_cache_inner(&self.l2, &l2_tags, &l2_data);
 
@@ -2001,8 +2001,7 @@ impl R4000Cache {
                 }
             }
         }
-        // ic.data (slot indices) is already restored by load_cache_inner above;
-        // l2.instrs is rebuilt from l2.data, so indices remain valid.
+        // l2.instrs is rebuilt from l2.data above; fetch() indexes it directly from phys_addr.
 
         if let Some(f) = get_field(v, "llbit") {
             if let Some(b) = toml_bool(f) { unsafe { *self.llbit.get() = b; } }
