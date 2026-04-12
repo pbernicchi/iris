@@ -398,16 +398,19 @@ impl Hal2 {
         let Some(tm) = self.timer_manager.get() else { return; };
         self.disarm_codeca();
 
-        let (dma_ch, mode, rate) = {
+        let (dma_ch, mode, rate, pitch_rate) = {
             let s = self.state.lock();
             let (ch, clk, mode) = s.codeca_cfg();
             let rate = s.bres_rate(clk);
-            (ch, mode, rate)
+            let (_, cb_clk, _) = s.codecb_cfg();
+            let cb_rate = s.bres_rate(cb_clk);
+            let pitch_rate = if cb_rate > 0 { cb_rate } else { 44100 };
+            (ch, mode, rate, pitch_rate)
         };
 
         if rate == 0 || dma_ch >= self.dma_clients.len() { return; }
 
-        let period = Duration::from_secs_f64(1.0 / rate as f64);
+        let period = Duration::from_secs_f64(1.0 / pitch_rate as f64);
         let dma_client = self.dma_clients[dma_ch].clone();
         let ca_state = self.ca_state.clone();
 
@@ -421,9 +424,10 @@ impl Hal2 {
             };
 
             // (Re)build resampler if codec rate changed.
-            if st.resampler.as_ref().map_or(true, |r| r.in_rate != rate) {
-                st.resampler = Some(Resampler::new(rate, stream_rate));
-                dlog_dev!(LogModule::Hal2, "HAL2: Codec A resampler {}Hz → {}Hz", rate, stream_rate);
+            // Use codec B rate as the declared input rate (experiment).
+            if st.resampler.as_ref().map_or(true, |r| r.in_rate != pitch_rate) {
+                st.resampler = Some(Resampler::new(pitch_rate, stream_rate));
+                dlog_dev!(LogModule::Hal2, "HAL2: Codec A resampler {}Hz (pitch={}) → {}Hz", rate, pitch_rate, stream_rate);
             }
 
             let frame = read_frame_from(&dma_client, mode);
@@ -659,7 +663,9 @@ impl Hal2 {
             let inc = state.bres_clock_inc[i] as u32;
             let modctrl = state.bres_clock_modctrl[i] as u32;
             let mod_val = inc.wrapping_sub(modctrl).wrapping_sub(1) & 0xFFFF;
-            if inc > 0 && mod_val > 0 {
+            if inc == 0 {
+                state.bres_clock_rate[i] = 0;
+            } else if mod_val > 0 {
                 state.bres_clock_rate[i] = (master * inc) / mod_val;
             }
         }
@@ -795,12 +801,18 @@ impl Hal2 {
                         IAR_PARAM_1 => {
                             state.bres_clock_sel[idx] = state.idr[0];
                             Self::update_rates(&mut state);
+                            let master = if state.bres_clock_sel[idx] == 0 { 48000 } else { 44100 };
+                            dlog_dev!(LogModule::Hal2, "HAL2: BRES{} sel={} ({}Hz master) → {}Hz",
+                                bres_idx, state.bres_clock_sel[idx], master, state.bres_clock_rate[idx]);
                             true
                         }
                         IAR_PARAM_2 => {
                             state.bres_clock_inc[idx]     = state.idr[0];
                             state.bres_clock_modctrl[idx] = state.idr[1];
                             Self::update_rates(&mut state);
+                            dlog_dev!(LogModule::Hal2, "HAL2: BRES{} inc={} modctrl={} → {}Hz",
+                                bres_idx, state.bres_clock_inc[idx], state.bres_clock_modctrl[idx],
+                                state.bres_clock_rate[idx]);
                             true
                         }
                         _ => false,
@@ -828,7 +840,9 @@ impl Hal2 {
             (ca_clk, cb_clk, at_clk, ar_clk, s.dma_enable)
         };
 
-        if (dma_enable & DMA_EN_CODECA) != 0 && ca_clk == bres_idx {
+        // Rearm codec A if its own clock changed, or if codec B's clock changed
+        // (codec A's timer period uses codec B's rate as pitch_rate).
+        if (dma_enable & DMA_EN_CODECA) != 0 && (ca_clk == bres_idx || cb_clk == bres_idx) {
             self.arm_codeca();
         }
         if (dma_enable & DMA_EN_CODECB) != 0 && cb_clk == bres_idx {
@@ -1036,8 +1050,9 @@ impl Device for Hal2 {
                 drop(s);
 
                 let ca = self.ca_state.lock();
-                writeln!(writer, "Codec A out: {}  prebuf: {}  prebuffering: {}  timer: {}",
+                writeln!(writer, "Codec A out: {}  pitch: {}  prebuf: {}  prebuffering: {}  timer: {}",
                     ca.out.as_ref().map_or("none".to_string(), |o| format!("{}Hz", o.stream_rate)),
+                    ca.resampler.as_ref().map_or("none".to_string(), |r| format!("{}Hz", r.in_rate)),
                     ca.prebuf.len() / 2,
                     ca.prebuffering,
                     ca.timer_id.map_or("none".to_string(), |id| format!("{:#x}", id)),
