@@ -4103,207 +4103,164 @@ impl Device for Rex3 {
 
 impl BusDevice for Rex3 {
     fn read32(&self, addr: u32) -> BusRead32 {
-        // Check if address is within the 8KB register window
         if (addr & 0xFFFFE000) != REX3_BASE {
             return BusRead32::ok(0);
         }
 
-        let offset = addr & (REX3_SIZE - 1);
-        // Decode GO command (bit 11 set) - usually ignored for reads but address aliasing applies
+        let offset     = addr & (REX3_SIZE - 1);
         let reg_offset = offset & !0x0800;
+        let is_go      = offset & 0x0800 != 0;
 
-        // HOSTRW reads: flush any pending GFIFO writes first (reads flush the pipeline).
-        // SET read: return current hostrw register value (no draw triggered).
-        // GO read:  return current hostrw register value, then enqueue an empty GO to
-        //           trigger processing of the next pixel batch.
-        if reg_offset == REX3_HOSTRW0 || reg_offset == REX3_HOSTRW1 {
-            let is_go = (offset & 0x0800) != 0;
-            if self.gfxbusy.load(Ordering::Acquire) || !self.gfifo.is_empty() {
-                return BusRead32::busy();
-            }
-            let full = self.hostrw.load(Ordering::Relaxed);
-            let val = if reg_offset == REX3_HOSTRW0 {
-                (full >> 32) as u32
-            } else {
-                full as u32
-            };
-            if is_go {
-                self.gfifo_push(GFIFO_PURE_GO, 0);
-            }
-            return BusRead32::ok(val);
+        // busy_or_val!(expr) — if pipeline is idle evaluate expr, else return busy.
+        // Used for registers that require the GFIFO to be drained before reading.
+        macro_rules! busy_or_val {
+            ($val:expr) => {{
+                if self.gfxbusy.load(Ordering::Acquire) || !self.gfifo.is_empty() {
+                    return BusRead32::busy();
+                }
+                BusRead32::ok($val)
+            }};
         }
 
-        // Handle Config registers
         let result = match reg_offset {
-            REX3_CONFIG => Some(BusRead32::ok(self.config.config.load(Ordering::Relaxed) & 0x1FFFFF)), // 21 bits
+            REX3_CONFIG => BusRead32::ok(self.config.config.load(Ordering::Relaxed) & 0x1FFFFF),
+
             REX3_STATUS | REX3_USER_STATUS => {
-                let mut val = self.config.status.load(Ordering::Relaxed) & 0xFFFFF; // 20 bits
-                val |= 3 << STATUS_VERSION_SHIFT; // REX3 version=3 (Newport XL24)
-                // gfxbusy: Acquire load — pairs with Release store(false) in draw loop,
-                // ensuring all context register writes by the draw thread are visible to us.
+                let mut val = self.config.status.load(Ordering::Relaxed) & 0xFFFFF;
+                val |= 3 << STATUS_VERSION_SHIFT;
                 let pending = self.gfifo.len();
                 if self.gfxbusy.load(Ordering::Acquire) || pending > 0 {
                     val |= STATUS_GFXBUSY;
                 } else {
                     val &= !STATUS_GFXBUSY;
                 }
-
-                // Map our large GFIFO onto the hardware 32-entry view:
-                //   0              → 0  (empty)
-                //   1 .. depth-32  → 1  (non-empty but plenty of room)
-                //   depth-31 .. depth → 2..32  (last 31 entries, filling up)
                 let level: u32 = if pending == 0 {
                     0
                 } else {
-                    let offset = pending.saturating_sub(GFIFO_DEPTH - GFIFO_HW_DEPTH);
-                    (offset as u32).max(1)
+                    (pending.saturating_sub(GFIFO_DEPTH - GFIFO_HW_DEPTH) as u32).max(1)
                 };
-                val &= !STATUS_GFIFOLEVEL_MASK;
-                val |= (level << STATUS_GFIFOLEVEL_SHIFT) & STATUS_GFIFOLEVEL_MASK;
-
+                val = (val & !STATUS_GFIFOLEVEL_MASK) | ((level << STATUS_GFIFOLEVEL_SHIFT) & STATUS_GFIFOLEVEL_MASK);
                 if reg_offset == REX3_STATUS {
-                    // Clear VRINT on read and deassert interrupt line — matching MAME:
-                    // interrupt stays asserted until STATUS is read, not on a timer.
                     let had_vrint = self.config.status.fetch_and(!STATUS_VRINT, Ordering::Relaxed) & STATUS_VRINT != 0;
                     if had_vrint {
                         let cb = self.vblank_cb.lock().clone();
                         if let Some(cb) = cb { cb(false); }
                     }
-                    // backbusy_until is in dcb, CPU-thread-only — no lock needed.
                     let dcb = self.dcb.lock();
                     if let Some(until) = dcb.backbusy_until {
-                        if std::time::Instant::now() < until {
-                            val |= STATUS_BACKBUSY;
-                        }
-                        // Don't clear expired backbusy here — dcb is borrowed immutably.
-                        // The next DCB addr=12 access will overwrite it anyway.
+                        if std::time::Instant::now() < until { val |= STATUS_BACKBUSY; }
                     }
-                    drop(dcb);
                 }
-                Some(BusRead32::ok(val & 0xFFFFF)) // Ensure 20 bits on return
+                BusRead32::ok(val & 0xFFFFF)
             }
-            // DCBMODE and DCBDATA use self.dcb mutex, handled below
-            _ => None,
-        };
 
-        let result = if let Some(res) = result {
-            res
-        } else {
-            match reg_offset {
-                REX3_DCBMODE => {
-                    self.diag.fetch_or(Self::DIAG_LOCK_DCB, Ordering::Relaxed);
-                    let val = self.dcb.lock().dcbmode & 0x1FFFFFFF;
-                    self.diag.fetch_and(!Self::DIAG_LOCK_DCB, Ordering::Relaxed);
-                    dlog_dev!(LogModule::Dcb, "DCB Mode Read -> {:08x}", val);
-                    BusRead32::ok(val)
-                }
-                REX3_DCBDATA0 => BusRead32::ok(self.dcb_read()),
-                REX3_DCBDATA1 => BusRead32::ok(self.dcb_read()),
-                _ => {
-                    // Context registers: stall (GRXDLY) until pipeline idle, modelled as EXEC_RETRY.
-                    // This lets cp0_count advance and interrupts fire between retries.
-                    if self.gfxbusy.load(Ordering::Acquire) || !self.gfifo.is_empty() {
-                        return BusRead32::busy();
-                    }
-                    let context = unsafe { &*self.context.get() };
-                    match reg_offset {
-                        REX3_DRAWMODE1 => BusRead32::ok(context.drawmode1.0), // 32 bits
-                        REX3_DRAWMODE0 => BusRead32::ok(context.drawmode0.0 & 0xFFFFFF), // 24 bits
-                        REX3_LSMODE => BusRead32::ok(context.lsmode.0 & 0x0FFFFFFF), // 28 bits
-                        REX3_LSPATTERN => BusRead32::ok(context.lspattern), // 32 bits
-                        REX3_LSPATSAVE => BusRead32::ok(context.lspatsave), // 32 bits
-                        REX3_ZPATTERN => BusRead32::ok(context.zpattern), // 32 bits
-                        REX3_LSSAVE => BusRead32::ok(context.lssave),
-                        REX3_LSRESTORE => BusRead32::ok(context.lsrestore),
-                        REX3_STEPZ => BusRead32::ok(context.stepz),
-                        REX3_STALL0 => BusRead32::ok(context.stall0),
-                        REX3_STALL1 => BusRead32::ok(context.stall1),
-                        REX3_COLORBACK => BusRead32::ok(context.colorback), // 32 bits
-                        REX3_COLORVRAM => BusRead32::ok(context.colorvram), // 32 bits
-                        REX3_ALPHAREF => BusRead32::ok(context.alpharef & 0xFF), // 8 bits
-                        REX3_SMASK0X => BusRead32::ok(context.smask0x), // 2c = two's complement, 16,16 = 32 bits
-                        REX3_SMASK0Y => BusRead32::ok(context.smask0y), // 2c = two's complement, 16,16 = 32 bits
-                        REX3_XSTART => BusRead32::ok(to16_4_7(context.xstart)),
-                        REX3_YSTART => BusRead32::ok(to16_4_7(context.ystart)),
-                        REX3_XEND => BusRead32::ok(to16_4_7(context.xend)),
-                        REX3_YEND => BusRead32::ok(to16_4_7(context.yend)),
-                        REX3_XSAVE => BusRead32::ok((context.xsave >> 11) as u32 & 0xFFFF), // 16 bits
-                        REX3_XYMOVE => BusRead32::ok(context.xymove), // 16,16 = 32 bits
-                        REX3_BRESD => BusRead32::ok(context.bresd & 0x7FFFFFF), // 27 bits
-                        REX3_BRESS1 => BusRead32::ok(context.bress1 & 0x1FFFF), // 17 bits
-                        REX3_BRESOCTINC1 => BusRead32::ok(context.bresoctinc1.0),
-                        REX3_BRESRNDINC2 => BusRead32::ok(context.bresrndinc2.0),
-                        REX3_BRESE1 => BusRead32::ok(context.brese1 & 0xFFFF), // 16 bits
-                        REX3_BRESS2 => BusRead32::ok(context.bress2 & 0x3FFFFFF), // 26 bits
-                        REX3_AWEIGHT0 => BusRead32::ok(context.aweight0), // 8 x 4 = 32 bits
-                        REX3_AWEIGHT1 => BusRead32::ok(context.aweight1), // 8 x 4 = 32 bits
-                        REX3_XSTARTF => BusRead32::ok(to12_4_7(context.xstart)),
-                        REX3_YSTARTF => BusRead32::ok(to12_4_7(context.ystart)),
-                        REX3_XENDF => BusRead32::ok(to12_4_7(context.xend)),
-                        REX3_YENDF => BusRead32::ok(to12_4_7(context.yend)),
-                        REX3_XSTARTI => BusRead32::ok((context.xstart >> 11) as u32 & 0xFFFF), // 16 bits integer
-                        REX3_XENDF1 => BusRead32::ok(to12_4_7(context.xend)),
-                        REX3_XYSTARTI => {
-                            let x = (context.xstart >> 11) as u16 as u32;
-                            let y = (context.ystart >> 11) as u16 as u32;
-                            BusRead32::ok((x << 16) | (y & 0xFFFF))
-                        }
-                        REX3_XYENDI => {
-                            let x = (context.xend >> 11) as u16 as u32;
-                            let y = (context.yend >> 11) as u16 as u32;
-                            BusRead32::ok((x << 16) | (y & 0xFFFF))
-                        }
-                        REX3_XSTARTENDI => {
-                            let start = (context.xstart >> 11) as u16 as u32;
-                            let end   = (context.xend   >> 11) as u16 as u32;
-                            BusRead32::ok((start << 16) | (end & 0xFFFF))
-                        }
-                        REX3_COLORRED => BusRead32::ok(to_color_red(context.colorred, context.drawmode1)),
-                        REX3_COLORALPHA => BusRead32::ok(to_color(context.coloralpha)),
-                        REX3_COLORGRN => BusRead32::ok(to_color(context.colorgrn)),
-                        REX3_COLORBLUE => BusRead32::ok(to_color(context.colorblue)),
-                        REX3_SLOPERED => BusRead32::ok(to_slope_red(context.slopered)),
-                        REX3_SLOPEALPHA => BusRead32::ok(to_slope(context.slopealpha)),
-                        REX3_SLOPEGRN => BusRead32::ok(to_slope(context.slopegrn)),
-                        REX3_SLOPEBLUE => BusRead32::ok(to_slope(context.slopeblue)),
-                        REX3_WRMASK => BusRead32::ok(context.wrmask & 0xFFFFFF), // 24 bits
-                        REX3_COLORI => BusRead32::ok(context.get_colori() & 0xFFFFFF), // 24 bits
-                        REX3_COLORX => BusRead32::ok(to_color_red(context.colorx, context.drawmode1) & 0xFFFFFF), // 24 bits
-                        REX3_SLOPERED1 => BusRead32::ok(to_slope_red(context.slopered)),
-                        REX3_SMASK1X => BusRead32::ok(context.smask1x),
-                        REX3_SMASK1Y => BusRead32::ok(context.smask1y),
-                        REX3_SMASK2X => BusRead32::ok(context.smask2x),
-                        REX3_SMASK2Y => BusRead32::ok(context.smask2y),
-                        REX3_SMASK3X => BusRead32::ok(context.smask3x),
-                        REX3_SMASK3Y => BusRead32::ok(context.smask3y),
-                        REX3_SMASK4X => BusRead32::ok(context.smask4x),
-                        REX3_SMASK4Y => BusRead32::ok(context.smask4y),
-                        REX3_TOPSCAN => BusRead32::ok(context.topscan & 0x3FF), // 10 bits
-                        REX3_XYWIN => BusRead32::ok(context.xywin), // 16,16 = 32 bits
-                        REX3_CLIPMODE => BusRead32::ok(context.clipmode & 0x1FFF), // 13 bits
-                        _ => {
-                            eprintln!("REX3 Read32: unhandled reg {:04x} ({})", reg_offset, rex3_reg_name(reg_offset));
-                            BusRead32::ok(0)
-                        }
+            REX3_DCBMODE => {
+                self.diag.fetch_or(Self::DIAG_LOCK_DCB, Ordering::Relaxed);
+                let val = self.dcb.lock().dcbmode & 0x1FFFFFFF;
+                self.diag.fetch_and(!Self::DIAG_LOCK_DCB, Ordering::Relaxed);
+                dlog_dev!(LogModule::Dcb, "DCB Mode Read -> {:08x}", val);
+                BusRead32::ok(val)
+            }
+            REX3_DCBDATA0 | REX3_DCBDATA1 => BusRead32::ok(self.dcb_read()),
+
+            REX3_HOSTRW0 => busy_or_val!((self.hostrw.load(Ordering::Relaxed) >> 32) as u32),
+            REX3_HOSTRW1 => busy_or_val!(self.hostrw.load(Ordering::Relaxed) as u32),
+
+            // Context registers: stall until pipeline idle.
+            _ => {
+                let ctx = unsafe { &*self.context.get() };
+                match reg_offset {
+                    REX3_DRAWMODE1    => busy_or_val!(ctx.drawmode1.0),
+                    REX3_DRAWMODE0    => busy_or_val!(ctx.drawmode0.0 & 0xFFFFFF),
+                    REX3_LSMODE       => busy_or_val!(ctx.lsmode.0 & 0x0FFFFFFF),
+                    REX3_LSPATTERN    => busy_or_val!(ctx.lspattern),
+                    REX3_LSPATSAVE    => busy_or_val!(ctx.lspatsave),
+                    REX3_ZPATTERN     => busy_or_val!(ctx.zpattern),
+                    REX3_LSSAVE       => busy_or_val!(ctx.lssave),
+                    REX3_LSRESTORE    => busy_or_val!(ctx.lsrestore),
+                    REX3_STEPZ        => busy_or_val!(ctx.stepz),
+                    REX3_STALL0       => busy_or_val!(ctx.stall0),
+                    REX3_STALL1       => busy_or_val!(ctx.stall1),
+                    REX3_COLORBACK    => busy_or_val!(ctx.colorback),
+                    REX3_COLORVRAM    => busy_or_val!(ctx.colorvram),
+                    REX3_ALPHAREF     => busy_or_val!(ctx.alpharef & 0xFF),
+                    REX3_SMASK0X      => busy_or_val!(ctx.smask0x),
+                    REX3_SMASK0Y      => busy_or_val!(ctx.smask0y),
+                    REX3_XSTART       => busy_or_val!(to16_4_7(ctx.xstart)),
+                    REX3_YSTART       => busy_or_val!(to16_4_7(ctx.ystart)),
+                    REX3_XEND         => busy_or_val!(to16_4_7(ctx.xend)),
+                    REX3_YEND         => busy_or_val!(to16_4_7(ctx.yend)),
+                    REX3_XSAVE        => busy_or_val!((ctx.xsave >> 11) as u32 & 0xFFFF),
+                    REX3_XYMOVE       => busy_or_val!(ctx.xymove),
+                    REX3_BRESD        => busy_or_val!(ctx.bresd & 0x7FFFFFF),
+                    REX3_BRESS1       => busy_or_val!(ctx.bress1 & 0x1FFFF),
+                    REX3_BRESOCTINC1  => busy_or_val!(ctx.bresoctinc1.0),
+                    REX3_BRESRNDINC2  => busy_or_val!(ctx.bresrndinc2.0),
+                    REX3_BRESE1       => busy_or_val!(ctx.brese1 & 0xFFFF),
+                    REX3_BRESS2       => busy_or_val!(ctx.bress2 & 0x3FFFFFF),
+                    REX3_AWEIGHT0     => busy_or_val!(ctx.aweight0),
+                    REX3_AWEIGHT1     => busy_or_val!(ctx.aweight1),
+                    REX3_XSTARTF      => busy_or_val!(to12_4_7(ctx.xstart)),
+                    REX3_YSTARTF      => busy_or_val!(to12_4_7(ctx.ystart)),
+                    REX3_XENDF        => busy_or_val!(to12_4_7(ctx.xend)),
+                    REX3_YENDF        => busy_or_val!(to12_4_7(ctx.yend)),
+                    REX3_XSTARTI      => busy_or_val!((ctx.xstart >> 11) as u32 & 0xFFFF),
+                    REX3_XENDF1       => busy_or_val!(to12_4_7(ctx.xend)),
+                    REX3_XYSTARTI     => busy_or_val!({
+                        let x = (ctx.xstart >> 11) as u16 as u32;
+                        let y = (ctx.ystart >> 11) as u16 as u32;
+                        (x << 16) | (y & 0xFFFF)
+                    }),
+                    REX3_XYENDI       => busy_or_val!({
+                        let x = (ctx.xend >> 11) as u16 as u32;
+                        let y = (ctx.yend >> 11) as u16 as u32;
+                        (x << 16) | (y & 0xFFFF)
+                    }),
+                    REX3_XSTARTENDI   => busy_or_val!({
+                        let start = (ctx.xstart >> 11) as u16 as u32;
+                        let end   = (ctx.xend   >> 11) as u16 as u32;
+                        (start << 16) | (end & 0xFFFF)
+                    }),
+                    REX3_COLORRED     => busy_or_val!(to_color_red(ctx.colorred, ctx.drawmode1)),
+                    REX3_COLORALPHA   => busy_or_val!(to_color(ctx.coloralpha)),
+                    REX3_COLORGRN     => busy_or_val!(to_color(ctx.colorgrn)),
+                    REX3_COLORBLUE    => busy_or_val!(to_color(ctx.colorblue)),
+                    REX3_SLOPERED     => busy_or_val!(to_slope_red(ctx.slopered)),
+                    REX3_SLOPEALPHA   => busy_or_val!(to_slope(ctx.slopealpha)),
+                    REX3_SLOPEGRN     => busy_or_val!(to_slope(ctx.slopegrn)),
+                    REX3_SLOPEBLUE    => busy_or_val!(to_slope(ctx.slopeblue)),
+                    REX3_WRMASK       => busy_or_val!(ctx.wrmask & 0xFFFFFF),
+                    REX3_COLORI       => busy_or_val!(ctx.get_colori() & 0xFFFFFF),
+                    REX3_COLORX       => busy_or_val!(to_color_red(ctx.colorx, ctx.drawmode1) & 0xFFFFFF),
+                    REX3_SLOPERED1    => busy_or_val!(to_slope_red(ctx.slopered)),
+                    REX3_SMASK1X      => busy_or_val!(ctx.smask1x),
+                    REX3_SMASK1Y      => busy_or_val!(ctx.smask1y),
+                    REX3_SMASK2X      => busy_or_val!(ctx.smask2x),
+                    REX3_SMASK2Y      => busy_or_val!(ctx.smask2y),
+                    REX3_SMASK3X      => busy_or_val!(ctx.smask3x),
+                    REX3_SMASK3Y      => busy_or_val!(ctx.smask3y),
+                    REX3_SMASK4X      => busy_or_val!(ctx.smask4x),
+                    REX3_SMASK4Y      => busy_or_val!(ctx.smask4y),
+                    REX3_TOPSCAN      => busy_or_val!(ctx.topscan & 0x3FF),
+                    REX3_XYWIN        => busy_or_val!(ctx.xywin),
+                    REX3_CLIPMODE     => busy_or_val!(ctx.clipmode & 0x1FFF),
+                    _ => {
+                        eprintln!("REX3 Read32: unhandled reg {:04x} ({})", reg_offset, rex3_reg_name(reg_offset));
+                        BusRead32::ok(0)
                     }
                 }
             }
         };
 
-        let is_dcb = reg_offset == REX3_DCBDATA0 || reg_offset == REX3_DCBDATA1 || reg_offset == REX3_DCBMODE || reg_offset == REX3_DCBRESET;
-        let is_hostrw = reg_offset == REX3_HOSTRW0 || reg_offset == REX3_HOSTRW1;
-        // STATUS/USER_STATUS are polled constantly; suppress to avoid spam.
-        let is_status = reg_offset == REX3_STATUS || reg_offset == REX3_USER_STATUS;
-        if !is_status {
+        // STATUS is polled constantly — suppress from debug log.
+        if reg_offset != REX3_STATUS && reg_offset != REX3_USER_STATUS {
             if result.is_ok() {
                 let val = result.data;
                 let mut dbg = self.debug_state.lock();
                 if dbg.last_offset == Some(offset) && dbg.last_val == val {
                     dbg.count += 1;
                 } else {
-                    if dbg.count > 0 {
-                        dlog_dev!(LogModule::Rex3, "... repeated {} times", dbg.count);
-                    }
+                    if dbg.count > 0 { dlog_dev!(LogModule::Rex3, "... repeated {} times", dbg.count); }
                     dbg.last_offset = Some(offset);
                     dbg.last_val = val;
                     dbg.count = 0;
@@ -4314,11 +4271,7 @@ impl BusDevice for Rex3 {
             }
         }
 
-        // GO bit on a non-HOSTRW read still triggers a draw (HOSTRW handled above).
-        if (offset & 0x0800) != 0 {
-            self.gfifo_push(GFIFO_PURE_GO, 0);
-        }
-
+        if is_go { self.gfifo_push(GFIFO_PURE_GO, 0); }
         result
     }
 
