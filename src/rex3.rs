@@ -3602,6 +3602,9 @@ impl Rex3 {
             REX3_TOPSCAN => ctx.topscan = val,
             REX3_XYWIN => ctx.xywin = val,
             REX3_CLIPMODE => ctx.clipmode = val,
+            // Handled on the CPU thread with immediate side effects; no draw-thread action needed.
+            REX3_CONFIG | REX3_STATUS | REX3_USER_STATUS |
+            REX3_DCBMODE | REX3_DCBDATA0 | REX3_DCBDATA1 | REX3_DCBRESET => {}
             _ => {
                 eprintln!("REX3 Write: unhandled reg {:04x} ({}), val {:08x}", reg_offset, rex3_reg_name(reg_offset), val);
             }
@@ -4413,53 +4416,38 @@ impl BusDevice for Rex3 {
             return BUS_OK;
         }
 
-        let offset = addr & (REX3_SIZE - 1);
-        
-        // Decode GO command (bit 11 set)
-        let is_go = (offset & 0x0800) != 0;
+        let offset     = addr & (REX3_SIZE - 1);
         let reg_offset = offset & !0x0800;
-
-        let is_dcb = reg_offset == REX3_DCBDATA0 || reg_offset == REX3_DCBDATA1 || reg_offset == REX3_DCBMODE || reg_offset == REX3_DCBRESET;
-        let is_hostrw = reg_offset == REX3_HOSTRW0 || reg_offset == REX3_HOSTRW1;
         dlog_dev!(LogModule::Rex3, "REX3 Write32: Offset {:04x} (Reg {:04x} {}) Val {:08x}", offset, reg_offset, rex3_reg_name(reg_offset), val);
 
-        // HOSTRW: route through GFIFO so the draw thread sees it in order.
-        // 32-bit write: val64=val zero-extended. GO write triggers draw; SET write just loads.
-        if is_hostrw {
-            self.gfifo_push(offset, val as u64);
-            return BUS_OK;
-        }
-
-        // Handle registers that need early return before GFIFO
-        let early_return = matches!(reg_offset,
-            REX3_CONFIG | REX3_STATUS | REX3_USER_STATUS |
-            REX3_DCBRESET | REX3_DCBMODE | REX3_DCBDATA0 | REX3_DCBDATA1);
-        if early_return {
-            match reg_offset {
-                REX3_CONFIG => { self.config.config.store(val, Ordering::Relaxed); }
-                REX3_STATUS | REX3_USER_STATUS => {} // writes ignored
-                REX3_DCBMODE => {
-                    self.diag.fetch_or(Self::DIAG_LOCK_DCB, Ordering::Relaxed);
-                    self.dcb.lock().dcbmode = val;
-                    self.diag.fetch_and(!Self::DIAG_LOCK_DCB, Ordering::Relaxed);
-                    dlog_dev!(LogModule::Dcb, "DCB Mode Write {:08x} (Addr {} CRS {} DW {} ENCRSINC={})",
-                        val,
-                        (val >> DCBMODE_DCBADDR_SHIFT) & 0xF,
-                        (val >> DCBMODE_DCBCRS_SHIFT) & 0x7,
-                        val & DCBMODE_DATAWIDTH_MASK,
-                        (val & DCBMODE_ENCRSINC) != 0);
-                }
-                REX3_DCBDATA0 | REX3_DCBDATA1 => { dlog_dev!(LogModule::Dcb, "DCB Write32: Offset {:04x} Val {:08x} -> dcb_write({:08x})", offset, val, val); self.dcb_write(val); }
-                REX3_DCBRESET => { *self.dcb.lock() = Rex3DcbState::default(); }
-                _ => {}
+        // Additionally handle the few registers that need immediate CPU-thread side effects.
+        match reg_offset {
+            REX3_CONFIG => { self.config.config.store(val, Ordering::Relaxed); }
+            REX3_DCBMODE => {
+                self.diag.fetch_or(Self::DIAG_LOCK_DCB, Ordering::Relaxed);
+                self.dcb.lock().dcbmode = val;
+                self.diag.fetch_and(!Self::DIAG_LOCK_DCB, Ordering::Relaxed);
+                dlog_dev!(LogModule::Dcb, "DCB Mode Write {:08x} (Addr {} CRS {} DW {} ENCRSINC={})",
+                    val,
+                    (val >> DCBMODE_DCBADDR_SHIFT) & 0xF,
+                    (val >> DCBMODE_DCBCRS_SHIFT) & 0x7,
+                    val & DCBMODE_DATAWIDTH_MASK,
+                    (val & DCBMODE_ENCRSINC) != 0);
             }
-            if is_go { self.gfifo_push(GFIFO_PURE_GO, 0); }
-            return BUS_OK;
+            REX3_DCBDATA0 | REX3_DCBDATA1 => {
+                dlog_dev!(LogModule::Dcb, "DCB Write32: Offset {:04x} Val {:08x} -> dcb_write({:08x})", offset, val, val);
+                self.dcb_write(val);
+            }
+            REX3_DCBRESET => { *self.dcb.lock() = Rex3DcbState::default(); }
+            _ => {
+                self.gfifo_push(offset, val as u64);
+                return BUS_OK;
+            }
         }
-
-        // Pack into GFIFO
-        self.gfifo_push(offset, val as u64);
-
+        // if any of the matched registers was written with go
+        if (offset & 0x0800) != 0 {
+            self.gfifo_push(GFIFO_PURE_GO, 0);
+        }
         BUS_OK
     }
 
