@@ -2036,22 +2036,29 @@ mod jit_tests {
 
     /// Build a Rex3 with JIT enabled.
     fn make_rex3_jit() -> &'static Rex3 {
-        let rex = Box::leak(Box::new(Rex3::new(
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(AtomicU64::new(0)),
-        )));
-        unsafe {
-            (*rex.fb_rgb.get()).fill(0);
-            (*rex.fb_aux.get()).fill(0);
-        }
-        rex.rex_jit = Some(std::sync::Arc::new(RexJit::new()));
-        rex.start();
-        rex
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let rex = Box::leak(Box::new(Rex3::new(
+                    Arc::new(AtomicU64::new(0)),
+                    Arc::new(AtomicU64::new(0)),
+                    Arc::new(AtomicU64::new(0)),
+                    Arc::new(AtomicU64::new(0)),
+                    Arc::new(AtomicU64::new(0)),
+                    Arc::new(AtomicU64::new(0)),
+                    Arc::new(AtomicU64::new(0)),
+                )));
+                unsafe {
+                    (*rex.fb_rgb.get()).fill(0);
+                    (*rex.fb_aux.get()).fill(0);
+                }
+                rex.rex_jit = Some(std::sync::Arc::new(RexJit::new()));
+                rex.start();
+                rex
+            })
+            .expect("make_rex3_jit thread panicked")
+            .join()
+            .expect("make_rex3_jit thread panicked")
     }
 
     /// Dump fb_rgb pixels in region (x0,y0)..(x1,y1) inclusive.
@@ -3221,13 +3228,9 @@ mod gfifo_tests {
     use std::thread;
 
     /// Helper: construct a standalone GFifo (not attached to a Rex3).
-    /// Uses Box::new directly to avoid materializing the ~3MB struct on the stack.
+    /// Uses Arc::new_zeroed to heap-allocate without touching the stack.
     fn make_gfifo() -> Arc<GFifo> {
-        unsafe {
-            let layout = std::alloc::Layout::new::<GFifo>();
-            let ptr = std::alloc::alloc_zeroed(layout) as *mut GFifo;
-            Arc::from_raw(ptr)
-        }
+        unsafe { Arc::new_zeroed().assume_init() }
     }
 
     /// SPSC: one producer thread pushes N items, one consumer thread pops them.
