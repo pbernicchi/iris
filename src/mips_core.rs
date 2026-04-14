@@ -89,14 +89,14 @@ pub struct MipsCore {
     pub compare_delta_stats: std::collections::HashMap<u32, u32>,
     /// Learned slow-tick CP0 delta in hardware counts (16.16 fixed-point, >> 16 = integer counts).
     /// Initialised to 0 (unknown). First delta seen is assumed to be the 100 Hz (slow) tick.
-    compare_delta_slow: u64,
+    pub compare_delta_slow: u64,
     /// Learned fast-tick CP0 delta in hardware counts.
     /// Initialised to 0 (unknown). Set once we see a delta ~10x smaller than delta_slow.
-    compare_delta_fast: u64,
+    pub compare_delta_fast: u64,
     /// The raw 16.16 fixed-point delta programmed in the *previous* Compare write.
     /// Used for calibration: dt_ns/dc measure the old interval, so count_step must be
     /// computed against the old delta, not the new one.  Zero = no previous write yet.
-    compare_delta_prev: u64,
+    pub compare_delta_prev: u64,
     pub cp0_status: u32,      // 12: Status Register
     pub cp0_cause: u32,       // 13: Cause Register
     pub cp0_epc: u64,         // 14: Exception Program Counter

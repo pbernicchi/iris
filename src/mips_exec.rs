@@ -4765,6 +4765,10 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> MipsCpu<T, C> {
         let ex = self.executor.clone();
         register_lock_fn("cpu::executor", move || ex.is_locked());
     }
+
+    fn try_lock_executor(&self) -> Result<parking_lot::MutexGuard<MipsExecutor<T, C>>, String> {
+        self.executor.try_lock().ok_or_else(|| "CPU thread holds the executor lock; try 'cpu stop' first".to_string())
+    }
 }
 
 fn is_call_instruction(instr: u32) -> bool {
@@ -5083,7 +5087,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
             if actual_args.is_empty() {
                 return Err("Usage: loadsym <file>".to_string());
             }
-            let exec = self.executor.lock();
+            let exec = self.try_lock_executor()?;
             let mut symbols = exec.symbols.lock();
             match symbols.load(actual_args[0]) {
                 Ok(count) => {
@@ -5098,7 +5102,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
             if actual_args.is_empty() {
                 return Err("Usage: sym <addr>".to_string());
             }
-            let exec = self.executor.lock();
+            let exec = self.try_lock_executor()?;
             let symbols = exec.symbols.lock();
             let addr = parse_cpu_arg(actual_args[0], &exec.core, Some(&symbols))?;
             
@@ -5116,7 +5120,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
         }
 
         if actual_cmd == "ll" {
-            let exec = self.executor.lock();
+            let exec = self.try_lock_executor()?;
             let llbit  = exec.cache.get_llbit();
             let lladdr = exec.cache.get_lladdr();
             let phys   = (lladdr as u64) << 4;
@@ -5133,7 +5137,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
             let op = actual_args[0];
             let val_str = if actual_args.len() > 1 { actual_args[1] } else { "0" };
             
-            let mut exec = self.executor.lock();
+            let mut exec = self.try_lock_executor()?;
             let symbols = exec.symbols.lock();
             let val = parse_cpu_arg(val_str, &exec.core, Some(&symbols))?;
             drop(symbols);
@@ -5200,11 +5204,19 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
             }
             "status" => {
                 let running = self.is_running();
-                let exec = self.executor.lock();
+                let exec = self.try_lock_executor()?;
                 let pc = exec.core.pc;
                 let symbols = exec.symbols.lock();
                 let sym_str = format_pc_symbol(pc, &symbols);
                 writeln!(writer, "{} pc={:016x}{}", if running { "running" } else { "stopped" }, pc, sym_str).unwrap();
+                let cs = exec.core.count_step;
+                let slow = exec.core.compare_delta_slow;
+                let fast = exec.core.compare_delta_fast;
+                let prev = exec.core.compare_delta_prev;
+                writeln!(writer, "  count_step={:#010x} ({:.4} hw/instr)",
+                    cs, cs as f64 / 65536.0).unwrap();
+                writeln!(writer, "  compare_delta_slow={:#010x} ({} hw-counts)  compare_delta_fast={:#010x} ({} hw-counts)  compare_delta_prev={:#010x} ({} hw-counts)",
+                    slow, slow >> 16, fast, fast >> 16, prev, prev >> 16).unwrap();
                 Ok(())
             }
             "run" | "c" | "cont" => {
@@ -5313,7 +5325,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
                 Ok(())
             }
             "regs" | "r" => {
-                let mut exec = self.executor.lock();
+                let mut exec = self.try_lock_executor()?;
                 if actual_args.is_empty() {
                     dump_regs(&mut exec, &mut writer);
                 } else {
@@ -5331,7 +5343,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
                 Ok(())
             }
             "cop0" => {
-                let mut exec = self.executor.lock();
+                let mut exec = self.try_lock_executor()?;
                 writeln!(writer, "COP0 Registers:").unwrap();
                 for i in 0..32 {
                     let val = exec.core.read_cp0(i);
@@ -5349,7 +5361,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
                 Ok(())
             }
             "cop1" => {
-                let exec = self.executor.lock();
+                let exec = self.try_lock_executor()?;
                 writeln!(writer, "COP1 Registers (FPU):").unwrap();
                 for i in 0..32 {
                     let val = exec.core.fpr[i];
@@ -5367,7 +5379,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
             }
             "mem" | "m" | "memory" => {
                 if actual_args.is_empty() { return Err("Usage: mem <addr> [count]".to_string()); }
-                let mut exec = self.executor.lock();
+                let mut exec = self.try_lock_executor()?;
                 let symbols_arc = exec.symbols.clone();
                 let symbols = symbols_arc.lock();
                 let addr = parse_cpu_arg(actual_args[0], &exec.core, Some(&symbols))?;
@@ -5383,7 +5395,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
                 Ok(())
             }
             "stack" => {
-                let mut exec = self.executor.lock();
+                let mut exec = self.try_lock_executor()?;
                 let sp = exec.core.read_gpr(29);
                 let symbols_arc = exec.symbols.clone();
                 let symbols = symbols_arc.lock();
@@ -5406,12 +5418,12 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
                 Ok(())
             }
             "bt" | "backtrace" => {
-                writeln!(writer, "{}", self.executor.lock().backtrace(20)).unwrap();
+                writeln!(writer, "{}", self.try_lock_executor()?.backtrace(20)).unwrap();
                 Ok(())
             }
             "mw" => {
                 if actual_args.len() < 2 { return Err("Usage: mw <addr> <val> [size: b|h|w|d]".to_string()); }
-                let mut exec = self.executor.lock();
+                let mut exec = self.try_lock_executor()?;
                 let symbols_arc = exec.symbols.clone();
                 let symbols = symbols_arc.lock();
                 
@@ -5442,7 +5454,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
             }
             "ms" => {
                 if actual_args.is_empty() { return Err("Usage: ms <addr> [max_len]".to_string()); }
-                let mut exec = self.executor.lock();
+                let mut exec = self.try_lock_executor()?;
                 let symbols_arc = exec.symbols.clone();
                 let symbols = symbols_arc.lock();
                 
@@ -5472,7 +5484,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
                 Ok(())
             }
             "dis" | "d" | "disasm" | "disassemble" => {
-                let mut exec = self.executor.lock();
+                let mut exec = self.try_lock_executor()?;
                 let symbols_arc = exec.symbols.clone();
                 let symbols = symbols_arc.lock();
                 let addr = if !actual_args.is_empty() {
@@ -5496,7 +5508,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
             }
             "jump" => {
                 if actual_args.is_empty() { return Err("Usage: jump <addr>".to_string()); }
-                let mut exec = self.executor.lock();
+                let mut exec = self.try_lock_executor()?;
                 let symbols_arc = exec.symbols.clone();
                 let symbols = symbols_arc.lock();
                 let addr = parse_cpu_arg(actual_args[0], &exec.core, Some(&symbols))?;
@@ -5506,7 +5518,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
             }
             "setreg" => {
                 if actual_args.len() < 2 { return Err("Usage: setreg <reg> <value>".to_string()); }
-                let mut exec = self.executor.lock();
+                let mut exec = self.try_lock_executor()?;
                 let symbols_arc = exec.symbols.clone();
                 let symbols = symbols_arc.lock();
                 let target = exp::parse_reg_target(actual_args[0])
@@ -5518,7 +5530,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
             }
             "translate" | "t" | "trans" => {
                 if actual_args.is_empty() { return Err("Usage: translate <addr>".to_string()); }
-                let mut exec = self.executor.lock();
+                let mut exec = self.try_lock_executor()?;
                 let symbols_arc = exec.symbols.clone();
                 let symbols = symbols_arc.lock();
                 let addr = parse_cpu_arg(actual_args[0], &exec.core, Some(&symbols))?;
@@ -5619,19 +5631,19 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
                 if !actual_args.is_empty() {
                     match actual_args[0] {
                         "on" | "1" if actual_args[0] == "on" || actual_args[0] == "1" => {
-                            let mut exec = self.executor.lock();
+                            let mut exec = self.try_lock_executor()?;
                             exec.undo_buffer.enable();
                             writeln!(writer, "CPU undo buffer enabled").unwrap();
                             return Ok(());
                         }
                         "off" | "0" if actual_args[0] == "off" || actual_args[0] == "0" => {
-                            let mut exec = self.executor.lock();
+                            let mut exec = self.try_lock_executor()?;
                             exec.undo_buffer.disable();
                             writeln!(writer, "CPU undo buffer disabled").unwrap();
                             return Ok(());
                         }
                         "clear" => {
-                            let mut exec = self.executor.lock();
+                            let mut exec = self.try_lock_executor()?;
                             exec.undo_buffer.clear();
                             writeln!(writer, "CPU undo buffer cleared").unwrap();
                             return Ok(());
@@ -5647,7 +5659,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
                     1
                 };
 
-                let mut exec = self.executor.lock();
+                let mut exec = self.try_lock_executor()?;
 
                 if !exec.undo_buffer.can_undo(count) {
                     return Err(format!("Cannot undo {} steps (only {} available)", count, exec.undo_buffer.count));
@@ -5674,7 +5686,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
             }
             "tlb" => {
                 if actual_args.is_empty() { return Err("Usage: tlb <dump|trans|debug> ...".to_string()); }
-                let exec = self.executor.lock();
+                let exec = self.try_lock_executor()?;
                 let tlb = &exec.tlb;
 
                 match actual_args[0] {
@@ -5708,7 +5720,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
                 } else {
                     10
                 };
-                let exec = self.executor.lock();
+                let exec = self.try_lock_executor()?;
                 let symbols = exec.symbols.lock();
                 let entries = exec.traceback.get_last(count);
                 writeln!(writer, "Execution Traceback (last {} instructions):", entries.len()).unwrap();
