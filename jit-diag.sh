@@ -41,7 +41,7 @@ OUTFILE="jit-diag-$(date +%Y%m%d-%H%M%S)-${MODE}.log"
 # Use the ncargo wrapper so we hit the rustup-pinned nightly toolchain
 # (rust-toolchain.toml) regardless of any homebrew rust on PATH.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CARGO="${SCRIPT_DIR}/ncargo"
+CARGO="$(which cargo)"
 
 features() {
     local base="$1"
