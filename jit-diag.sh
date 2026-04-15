@@ -99,10 +99,29 @@ case "$MODE" in
     PERFREPORT="perf-report-jit-$(date +%Y%m%d-%H%M%S).txt"
     echo "Building (profiling profile, jit feature)..." | tee -a "$OUTFILE"
     "$CARGO" build --profile profiling --features jit,lightning 2>&1 | tee -a "$OUTFILE"
-    echo "--- Press Ctrl-C when you have enough samples ---"
-    IRIS_JIT=1 perf record -F 99 --call-graph dwarf -o perf.data -- ./target/profiling/iris
-    echo "Processing perf data..." | tee -a "$OUTFILE"
-    perf report --stdio --no-children -i perf.data > "$PERFREPORT" 2>&1
+    case "$(uname -s)" in
+      Linux)
+        echo "--- Press Ctrl-C when you have enough samples ---"
+        IRIS_JIT=1 perf record -F 99 --call-graph dwarf -o perf.data -- ./target/profiling/iris
+        echo "Processing perf data..." | tee -a "$OUTFILE"
+        perf report --stdio --no-children -i perf.data > "$PERFREPORT" 2>&1
+        ;;
+      Darwin)
+        DURATION="${PERF_DURATION:-30}"
+        echo "--- Launching iris; will sample for ${DURATION}s after it starts ---"
+        IRIS_JIT=1 ./target/profiling/iris &
+        IRIS_PID=$!
+        sleep 2
+        echo "Sampling PID $IRIS_PID for ${DURATION}s..."
+        sample "$IRIS_PID" "$DURATION" -f "$PERFREPORT" 2>&1 || true
+        kill "$IRIS_PID" 2>/dev/null
+        wait "$IRIS_PID" 2>/dev/null
+        ;;
+      *)
+        echo "Unsupported platform for profiling: $(uname -s)"
+        exit 1
+        ;;
+    esac
     echo "Perf report saved to: $PERFREPORT"
     ;;
   smoke)

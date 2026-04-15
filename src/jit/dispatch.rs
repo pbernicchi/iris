@@ -214,15 +214,12 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
     let mut chain_break_exc: u64 = 0;   // exception in chained block
     let mut chain_break_limit: u64 = 0; // hit MAX_CHAIN_INSTRS
 
-    // Load saved profile — but DON'T eagerly compile above-Alu blocks.
-    // trace_block calls debug_fetch_instr which reads memory at kernel
-    // addresses that haven't been loaded yet during startup. Those reads
-    // hit CpuBusErrorDevice → MC CPU Error registers get set → PROM sees
-    // the error status during its hardware check and enters a retry loop.
-    // Blocks will compile on first cache hit during execution instead.
-    {
-        let _profile_entries = profile::load_profile();
-    }
+    // Load saved profile but DON'T pre-compile. Two attempts at pre-
+    // compilation (upfront and incremental) both triggered IRIX UTLB-miss
+    // panics after PROM exit. Likely the I-cache side effects of many
+    // debug_fetch_instr calls during pre-compile evict L2/D-cache lines the
+    // kernel depends on, or something subtler. Blocks compile on-demand.
+    let _profile_entries = profile::load_profile();
 
     while running.load(Ordering::Relaxed) {
         let mut steps_in_batch: u32 = 0;
@@ -264,6 +261,7 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
                 probe.record_miss();
                 continue;
             }
+
 
             let phys_pc = {
                 let exec = unsafe { &mut *exec_ptr };

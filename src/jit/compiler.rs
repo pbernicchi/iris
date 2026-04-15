@@ -39,7 +39,13 @@ pub struct BlockCompiler {
 impl BlockCompiler {
     pub fn new(helpers: &HelperPtrs) -> Self {
         let mut flag_builder = settings::builder();
-        flag_builder.set("opt_level", "speed").unwrap();
+        // opt_level=none: Cranelift skips several optimization passes.
+        // Generated code is ~10-20% slower per instruction than "speed",
+        // but compile time drops 3-5x. Profiling showed 66% of MIPS-CPU
+        // thread time was in Cranelift passes, so this is the right trade
+        // for our interpreter-first JIT (hot blocks run few hundred times
+        // before being superseded by chained neighbors).
+        flag_builder.set("opt_level", "none").unwrap();
         flag_builder.set("is_pic", "false").unwrap();
 
         let isa_builder = cranelift_native::builder().expect("host ISA not supported");
