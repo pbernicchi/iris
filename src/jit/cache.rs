@@ -74,14 +74,24 @@ pub struct CompiledBlock {
     pub stable_hits:     u32,
     /// True when this block is in a trial period (not yet fully trusted at current tier).
     pub speculative:     bool,
+    /// FNV-1a hash of the raw instruction words; used to detect stale profile
+    /// entries when a different DSO is loaded at the same virtual address.
+    pub content_hash:    u32,
 }
 
 // Safety: CompiledBlock is only accessed from the CPU thread.
 unsafe impl Send for CompiledBlock {}
 
-/// Code cache keyed by physical PC (aligned to 4 bytes).
+/// Code cache keyed by (physical PC, virtual PC).
+///
+/// Physical PC alone is insufficient: compiled blocks bake virtual PC constants
+/// for exit PC and branch targets. When different virtual addresses map to the
+/// same physical page (shared libraries, fork), a block compiled for virtual
+/// address A would produce wrong exit PCs when executed at virtual address B.
+/// Including the virtual PC in the key ensures each virtual mapping gets its
+/// own correctly-compiled block.
 pub struct CodeCache {
-    blocks: HashMap<u64, CompiledBlock>,
+    blocks: HashMap<(u64, u64), CompiledBlock>,
 }
 
 impl CodeCache {
@@ -91,26 +101,30 @@ impl CodeCache {
         }
     }
 
-    pub fn lookup(&self, phys_pc: u64) -> Option<&CompiledBlock> {
-        self.blocks.get(&phys_pc)
+    pub fn lookup(&self, phys_pc: u64, virt_pc: u64) -> Option<&CompiledBlock> {
+        self.blocks.get(&(phys_pc, virt_pc))
     }
 
-    pub fn lookup_mut(&mut self, phys_pc: u64) -> Option<&mut CompiledBlock> {
-        self.blocks.get_mut(&phys_pc)
+    pub fn contains(&self, phys_pc: u64, virt_pc: u64) -> bool {
+        self.blocks.contains_key(&(phys_pc, virt_pc))
     }
 
-    pub fn insert(&mut self, phys_pc: u64, block: CompiledBlock) {
-        self.blocks.insert(phys_pc, block);
+    pub fn lookup_mut(&mut self, phys_pc: u64, virt_pc: u64) -> Option<&mut CompiledBlock> {
+        self.blocks.get_mut(&(phys_pc, virt_pc))
     }
 
-    pub fn replace(&mut self, phys_pc: u64, block: CompiledBlock) {
-        self.blocks.insert(phys_pc, block);
+    pub fn insert(&mut self, phys_pc: u64, virt_pc: u64, block: CompiledBlock) {
+        self.blocks.insert((phys_pc, virt_pc), block);
+    }
+
+    pub fn replace(&mut self, phys_pc: u64, virt_pc: u64, block: CompiledBlock) {
+        self.blocks.insert((phys_pc, virt_pc), block);
     }
 
     /// Invalidate all blocks that overlap a physical address range.
     /// Called when self-modifying code is detected or CACHE instruction executes.
     pub fn invalidate_range(&mut self, phys_start: u64, phys_end: u64) {
-        self.blocks.retain(|&addr, block| {
+        self.blocks.retain(|&(addr, _), block| {
             let block_end = addr + (block.len_mips as u64 * 4);
             addr >= phys_end || block_end <= phys_start
         });
@@ -125,7 +139,7 @@ impl CodeCache {
         self.blocks.len()
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (&u64, &CompiledBlock)> {
+    pub fn iter(&self) -> impl Iterator<Item = (&(u64, u64), &CompiledBlock)> {
         self.blocks.iter()
     }
 }
