@@ -523,6 +523,9 @@ impl Ui {
                         }
                     }
                     #[cfg(feature = "mouseabs")]
+                    // mouse_last is being assigned None in two places (lines 522 & 554) but the value is never subsequently read — it gets overwritten before use. 
+                    // Dead code? Unclear if this is meant to be consumed downstream.
+                    _ => mouse_last, 
                     WindowEvent::CursorMoved { position, .. } => {
                         if mouse_grabbed {
                             let size = window.inner_size();
@@ -627,7 +630,7 @@ impl Ui {
         let rem_x = dx - step_x * (steps - 1);
         let rem_y = dy - step_y * (steps - 1);
 
-        let mut send = |sx: i32, sy: i32| {
+        let send = |sx: i32, sy: i32| {
             let mut b0 = 0x08u8 | (buttons & 0x07);
             if sx < 0 { b0 |= 0x10; }
             if sy < 0 { b0 |= 0x20; }

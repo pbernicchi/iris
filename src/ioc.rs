@@ -357,7 +357,7 @@ impl Device for Ioc {
         cmds
     }
 
-    fn execute_command(&self, cmd: &str, args: &[&str], mut writer: Box<dyn Write + Send>) -> Result<(), String> {
+    fn execute_command(&self, cmd: &str, args: &[&str], writer: Box<dyn Write + Send>) -> Result<(), String> {
         if cmd == "ioc" {
             return Err("Usage: ioc status".to_string());
         }
