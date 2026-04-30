@@ -19,6 +19,7 @@ rex-jit = ["cranelift-codegen", "cranelift-frontend", "cranelift-jit", "cranelif
 # Use WindowEvent::CursorMoved for mouse motion instead of DeviceEvent::MouseMotion.
 # Useful for testing absolute cursor position tracking. May cause doubled moves on some platforms.
 mouseabs = []
+developerx = []
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

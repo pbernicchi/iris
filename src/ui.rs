@@ -627,7 +627,7 @@ impl Ui {
         let rem_x = dx - step_x * (steps - 1);
         let rem_y = dy - step_y * (steps - 1);
 
-        let mut send = |sx: i32, sy: i32| {
+        let send = |sx: i32, sy: i32| {
             let mut b0 = 0x08u8 | (buttons & 0x07);
             if sx < 0 { b0 |= 0x10; }
             if sy < 0 { b0 |= 0x20; }

@@ -4766,7 +4766,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> MipsCpu<T, C> {
         register_lock_fn("cpu::executor", move || ex.is_locked());
     }
 
-    fn try_lock_executor(&self) -> Result<parking_lot::MutexGuard<MipsExecutor<T, C>>, String> {
+    fn try_lock_executor(&self) -> Result<parking_lot::MutexGuard<'_, MipsExecutor<T, C>>, String> {
         self.executor.try_lock().ok_or_else(|| "CPU thread holds the executor lock; try 'cpu stop' first".to_string())
     }
 }
