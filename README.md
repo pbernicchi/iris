@@ -133,6 +133,15 @@ Writes go to `scsi1.raw.overlay`. Monitor commands:
 - `cow reset` - discard all overlay writes
 
 
+## Display
+
+Window scale factor is set in `iris.toml`:
+```toml
+scale = 2   # 1 = native, 2 = 2× for HiDPI/4K monitors
+```
+The `--2x` CLI flag overrides the config file value.
+
+
 ## Input
 
 Click the window to grab mouse and keyboard. Right Ctrl releases the grab.

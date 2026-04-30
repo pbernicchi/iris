@@ -15,7 +15,7 @@ prom = "prom.bin"
 
 # Window scale factor: 1 = native resolution, 2 = 2× for HiDPI/4K monitors.
 # Can also be set with the --2x command-line flag (CLI takes precedence).
-scale = 1
+scale = 2
 
 # RAM bank sizes in MB.
 # Each bank must be 0 (absent), 8, 16, 32, 64, or 128.
@@ -34,11 +34,12 @@ banks = [128, 128, 0, 0]
 [scsi.1]
 path   = "scsi1.raw"
 cdrom  = false
+overlay = true
 
 # Internal hard disk
-[scsi.2]
-path   = "scsi2.raw"
-cdrom  = false
+#[scsi.2]
+#path   = "scsi2.raw"
+#cdrom  = false
 
 # NFS share — requires unfsd on the host.
 # The shared directory is exported to the VM at 192.168.0.1:/path (standard NFS port 2049).
@@ -77,7 +78,7 @@ bind       = "localhost"
 # For a single disc, set path only.
 # For a changer (cycled with "scsi eject 4" in the monitor), list all
 # ISO images in `discs`; the first entry is mounted at startup.
-[scsi.4]
-path   = "cdrom4.iso"
-cdrom  = true
+#[scsi.4]
+#path   = "cdrom4.iso"
+#cdrom  = true
 #discs = ["second.iso", "cdrom4.iso", "patches.iso"]

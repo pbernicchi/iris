@@ -7,5 +7,7 @@ tasks.json
 scsi1.raw
 scsi2.raw
 cdrom4.iso
+*.overlay
+prom.bin
 Cargo.lock
 *.log
