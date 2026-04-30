@@ -462,6 +462,7 @@ impl Ui {
         let mut mouse_grabbed = false;
         // Warp-to-center mouse handling: on each real CursorMoved, accumulate
         // delta into shared MouseDelta. A 10ms timer flushes it to PS/2.
+        #[cfg(feature = "mouseabs")]
         let mut mouse_last: Option<PhysicalPosition<f64>> = None;
         let mouse_delta = Arc::new(Mutex::new(MouseDelta { accum: (0.0, 0.0), buttons: 0 }));
 
@@ -518,7 +519,8 @@ impl Ui {
                             }
                             window.set_cursor_visible(false);
                             // Reset warp and delta state on grab.
-                            mouse_last = None;
+                            #[cfg(feature = "mouseabs")]
+                            { mouse_last = None; }
                             mouse_delta.lock().accum = (0.0, 0.0);
                         }
                     }
@@ -550,7 +552,8 @@ impl Ui {
                             mouse_grabbed = false;
                             let _ = window.set_cursor_grab(winit::window::CursorGrabMode::None);
                             window.set_cursor_visible(true);
-                            mouse_last = None;
+                            #[cfg(feature = "mouseabs")]
+                            { mouse_last = None; }
                         }
                     }
                     WindowEvent::RedrawRequested => {
